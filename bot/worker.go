@@ -170,6 +170,38 @@ func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) {
 	}
 }
 
+// findParentBySHA 根据 commit SHA 查找同一仓库下的推送消息
+func findParentBySHA(ctx context.Context, repo, sha string) string {
+	if sha == "" || repo == "" {
+		return ""
+	}
+	var record MessageRecord
+	if err := DB.NewSelect().Model(&record).
+		Where("repo_name = ?", repo).
+		Where("github_id LIKE ? OR (event_type = 'push' AND content LIKE ?)",
+			"%"+sha+"%", "%"+sha+"%").
+		Order("id ASC").Limit(1).Scan(ctx); err == nil {
+		return record.FeishuMessageID
+	}
+	return ""
+}
+
+// findRecentRepoPush 查找同一仓库最近的推送消息（用于 tag/workflow 关联 commit）
+func findRecentRepoPush(ctx context.Context, repo string) string {
+	if repo == "" {
+		return ""
+	}
+	var record MessageRecord
+	if err := DB.NewSelect().Model(&record).
+		Where("repo_name = ?", repo).
+		Where("event_type = ? OR event_type = ?", "push", "create").
+		Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
+		Order("id DESC").Limit(1).Scan(ctx); err == nil {
+		return record.FeishuMessageID
+	}
+	return ""
+}
+
 func processWebhookEvent(event WebhookEvent) error {
 	ctx := context.Background()
 
@@ -181,6 +213,9 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	detail := ParseEvent(githubEvent, event.EventType)
+	if detail.EventTime == "" && !event.CreatedAt.IsZero() {
+		detail.EventTime = event.CreatedAt.Format(time.RFC3339)
+	}
 	if detail.Skip {
 		return nil
 	}
@@ -404,9 +439,28 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
-	// 5. 查找父级 ID (回复逻辑)
+	// 4.6 Tag/Workflow 关联最近的 commit，以话题形式回复
 	var parentID string
-	// 改为：只要是 Issue/PR/Workflow 相关的非“创建”事件，都尝试寻找父消息进行话题回复
+	if event.EventType == "create" && detail.IsTag {
+		if sha != "" {
+			parentID = findParentBySHA(ctx, repo, sha)
+		}
+		if parentID == "" {
+			parentID = findRecentRepoPush(ctx, repo)
+		}
+	}
+	if isCIEvent && parentID == "" {
+		// CI 事件未找到已有记录（否则已在 4.1 返回），尝试关联到最近的 commit
+		if sha != "" {
+			parentID = findParentBySHA(ctx, repo, sha)
+		}
+		if parentID == "" {
+			parentID = findRecentRepoPush(ctx, repo)
+		}
+	}
+
+	// 5. 查找父级 ID (回复逻辑)
+	// 改为：只要是 Issue/PR/Workflow 相关的非”创建”事件，都尝试寻找父消息进行话题回复
 	isInteraction := event.EventType == "issue_comment" ||
 		event.EventType == "pull_request_review_comment" ||
 		event.EventType == "pull_request_review" ||
@@ -420,7 +474,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	action := ext(m, "action")
 	if isInteraction && action != "opened" {
 		commitId := sha // 使用已经提取好的 sha
-		if commitId != "" {
+		if parentID == "" && commitId != "" {
 			var record MessageRecord
 			// 始终按 ID 升序取第一条 (Root message)
 			// 优化：增加对 push 记录 content 的模糊匹配，因为 push 记录的 github_id 不含 SHA

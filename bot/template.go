@@ -27,6 +27,7 @@ type EventDetail struct {
 	AuthorLogins  []string `json:"author_logins"`  // 提交者或协作者的 login 列表（与 AuthorAvatars 顺序对应）
 	Action        string   `json:"action"`         // 事件具体动作
 	ExtraReply    string   `json:"extra_reply"`    // 需要另起一段话题回复的内容
+	EventTime     string   `json:"event_time"`     // GitHub 事件原始发生时间 (RFC3339)
 }
 
 // ParseEvent 解析 GitHub 事件为极简明了的 Detail
@@ -214,6 +215,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			} else {
 				d.SHA = sha
 			}
+			if ts := hc.GetTimestamp(); !ts.IsZero() {
+				d.EventTime = ts.Time.Format(time.RFC3339)
+			}
 		}
 		d.Action = "push"
 
@@ -282,6 +286,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			}
 		}
 		d.URL = pr.GetHTMLURL()
+		if ts := pr.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.IssuesEvent:
 		action := e.GetAction()
@@ -309,6 +316,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 		d.FoldableBody = foldable
 		d.URL = iss.GetHTMLURL()
 		d.Action = action
+		if ts := iss.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.IssueCommentEvent:
 		iss := e.GetIssue()
@@ -337,6 +347,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.Text = fmt.Sprintf("**%s**", iss.GetTitle())
 		}
 		d.URL = e.GetComment().GetHTMLURL()
+		if ts := comment.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.PullRequestReviewCommentEvent:
 		pr := e.GetPullRequest()
@@ -362,6 +375,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.Text = fmt.Sprintf("**%s**", pr.GetTitle())
 		}
 		d.URL = comment.GetHTMLURL()
+		if ts := comment.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.PullRequestReviewEvent:
 		pr := e.GetPullRequest()
@@ -384,6 +400,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.Text = fmt.Sprintf("**%s**", pr.GetTitle())
 		}
 		d.URL = review.GetHTMLURL()
+		if ts := review.GetSubmittedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.WorkflowRunEvent:
 		wr := e.GetWorkflowRun()
@@ -449,6 +468,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 		d.Text = strings.Join(lines, "\n")
 		d.RefName = ref
 		d.URL = wr.GetHTMLURL()
+		if ts := wr.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.WorkflowJobEvent:
 		wj := e.GetWorkflowJob()
@@ -513,6 +535,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			}
 		}
 		d.URL = wj.GetHTMLURL()
+		if ts := wj.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.CheckRunEvent:
 		cr := e.GetCheckRun()
@@ -586,6 +611,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 		d.Text = fmt.Sprintf("%s check suite %s", icon, stateVerb)
 		d.URL = "" // CheckSuite does not have a direct HTMLURL field in go-github
 		d.RefName = cs.GetHeadBranch()
+		if ts := cs.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.WatchEvent:
 		d.Title = "⭐ New Star!"
@@ -608,6 +636,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.Title = "🍴 Repository Forked"
 		d.Text = fmt.Sprintf("Repository forked to [%s](%s)", forkee.GetFullName(), forkee.GetHTMLURL())
+		if ts := forkee.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.GollumEvent:
 		d.Title = "📖 Wiki Updated"
@@ -653,6 +684,11 @@ func ParseEvent(event any, eventType string) EventDetail {
 		d.Text = "This repository is now visible to everyone."
 
 	case *github.RepositoryEvent:
+		if repo := e.GetRepo(); repo != nil {
+			if ts := repo.GetCreatedAt(); !ts.IsZero() {
+				d.EventTime = ts.Format(time.RFC3339)
+			}
+		}
 		action := e.GetAction()
 		switch action {
 		case "publicized":
@@ -700,6 +736,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.AuthorLogins = []string{login}
 			d.AuthorAvatars = []string{member.GetAvatarURL()}
 		}
+		if ts := org.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.TeamEvent:
 		team := e.GetTeam()
@@ -727,6 +766,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 		d.URL = member.GetHTMLURL()
 		d.AuthorLogins = []string{member.GetLogin()}
 		d.AuthorAvatars = []string{member.GetAvatarURL()}
+		if ts := member.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.ReleaseEvent:
 		action := e.GetAction()
@@ -779,6 +821,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			}
 		}
 		d.Text = strings.Join(lines, "\n")
+		if ts := release.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.MembershipEvent:
 		member := e.GetMember()
@@ -1007,6 +1052,14 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 			{Text: "View Details", URL: detail.URL, Type: btnType},
 		}
 		card.AddActions("flow", btns...)
+	}
+
+	// --- 5. 事件发生时间 ---
+	if detail.EventTime != "" {
+		if t, err := time.Parse(time.RFC3339, detail.EventTime); err == nil {
+			loc, _ := time.LoadLocation("Asia/Shanghai")
+			card.AddNoteText(fmt.Sprintf("🕐 %s", t.In(loc).Format("2006-01-02 15:04:05")))
+		}
 	}
 
 	return card
