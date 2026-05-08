@@ -1058,7 +1058,7 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 	if detail.EventTime != "" {
 		if t, err := time.Parse(time.RFC3339, detail.EventTime); err == nil {
 			loc, _ := time.LoadLocation("Asia/Shanghai")
-			card.AddNoteText(fmt.Sprintf("🕐 %s", t.In(loc).Format("2006-01-02 15:04:05")))
+			card.AddMarkdown(fmt.Sprintf("🕐 %s", t.In(loc).Format("2006-01-02 15:04:05")))
 		}
 	}
 
