@@ -170,10 +170,10 @@ func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) {
 	}
 }
 
-// findParentBySHA 根据 commit SHA 查找同一仓库下的推送消息
-func findParentBySHA(ctx context.Context, repo, sha string) string {
+// findParentRecordBySHA 根据 commit SHA 查找同一仓库下的推送消息记录
+func findParentRecordBySHA(ctx context.Context, repo, sha string) *MessageRecord {
 	if sha == "" || repo == "" {
-		return ""
+		return nil
 	}
 	var record MessageRecord
 	if err := DB.NewSelect().Model(&record).
@@ -181,9 +181,9 @@ func findParentBySHA(ctx context.Context, repo, sha string) string {
 		Where("github_id LIKE ? OR (event_type = 'push' AND content LIKE ?)",
 			"%"+sha+"%", "%"+sha+"%").
 		Order("id ASC").Limit(1).Scan(ctx); err == nil {
-		return record.FeishuMessageID
+		return &record
 	}
-	return ""
+	return nil
 }
 
 // findRecentRepoPush 查找同一仓库最近的推送消息（用于 tag/workflow 关联 commit）
@@ -443,21 +443,26 @@ func processWebhookEvent(event WebhookEvent) error {
 	var parentID string
 	if event.EventType == "create" && detail.IsTag {
 		if sha != "" {
-			parentID = findParentBySHA(ctx, repo, sha)
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				parentID = rec.FeishuMessageID
+			}
 		}
 		if parentID == "" {
 			parentID = findRecentRepoPush(ctx, repo)
 		}
 	}
 	if isCIEvent && parentID == "" {
-		// CI 事件未找到已有记录（否则已在 4.1 返回），尝试关联到最近的 commit
+		// CI 事件未找到已有记录（否则已在 4.1 返回），尝试关联到 push 事件
 		if sha != "" {
-			parentID = findParentBySHA(ctx, repo, sha)
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				// 仅当 push 消息是在合并窗口内创建的才回复到该话题
+				// 手动触发、定时触发等关联旧 commit 的情况不回复
+				if time.Since(rec.UpdatedAt) <= getMergeWindow() {
+					parentID = rec.FeishuMessageID
+				}
+			}
 		}
-		if parentID == "" {
-			parentID = findRecentRepoPush(ctx, repo)
-		}
-		// 首次 CI 事件仍找不到父消息，且关联的 push 事件还在队列中，等待 push 处理后再重试
+		// 找不到父消息，检查关联的 push 事件是否还在队列中（事件到达顺序不确定）
 		if parentID == "" && ext(m, "action") == "requested" && sha != "" {
 			var pendingPush WebhookEvent
 			if err := DB.NewSelect().Model(&pendingPush).
