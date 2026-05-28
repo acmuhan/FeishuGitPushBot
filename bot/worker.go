@@ -393,7 +393,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			mergeSearch{githubID: githubID, withinWindow: true},
 			func(old, new *EventDetail) {
 				new.Text = old.Text + "\n" + new.Text
-				new.Title = "🍏 Branch Push (Merged)"
+				new.Title = "🍏 Branch Push"
 			},
 			&detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Push merged",
