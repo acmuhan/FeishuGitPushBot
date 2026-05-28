@@ -1029,7 +1029,15 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 	// --- 2. 详情内容 ---
 	if detail.Text != "" {
 		card.AddDivider()
-		card.AddMarkdown(detail.Text)
+		// 内容过长时截断摘要，完整内容放入折叠面板
+		const maxInlineRunes = 600
+		if len([]rune(detail.Text)) > maxInlineRunes {
+			summary := truncateAtLine(detail.Text, 300)
+			card.AddMarkdown(summary)
+			card.AddCollapsiblePanel("", detail.Text)
+		} else {
+			card.AddMarkdown(detail.Text)
+		}
 	}
 
 	// --- 3. 可折叠的附加内容（PR body 中的 <details> 块等）---
@@ -1090,6 +1098,19 @@ func SafeText(s string, maxRunes int) string {
 		return string(runes[:maxRunes]) + "..."
 	}
 	return s
+}
+
+// truncateAtLine 在行边界处截断文本，保留不超过 maxRunes 个字符的完整行
+func truncateAtLine(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	truncated := string(runes[:maxRunes])
+	if idx := strings.LastIndex(truncated, "\n"); idx > 0 {
+		truncated = truncated[:idx]
+	}
+	return truncated + "\n..."
 }
 
 var conventionalRegex = regexp.MustCompile(`(?i)(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|ref)(\([^)]+\))?(!?):`)
