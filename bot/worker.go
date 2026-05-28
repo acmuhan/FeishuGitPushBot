@@ -457,6 +457,17 @@ func processWebhookEvent(event WebhookEvent) error {
 		if parentID == "" {
 			parentID = findRecentRepoPush(ctx, repo)
 		}
+		// 首次 CI 事件仍找不到父消息，且关联的 push 事件还在队列中，等待 push 处理后再重试
+		if parentID == "" && ext(m, "action") == "requested" && sha != "" {
+			var pendingPush WebhookEvent
+			if err := DB.NewSelect().Model(&pendingPush).
+				Where("event_type = ?", "push").
+				Where("status = ? OR status = ?", "pending", "processing").
+				Where("payload LIKE ?", "%"+sha+"%").
+				Limit(1).Scan(ctx); err == nil {
+				return fmt.Errorf("waiting for push event to create commit topic (sha: %s)", sha)
+			}
+		}
 	}
 
 	// 5. 查找父级 ID (回复逻辑)
