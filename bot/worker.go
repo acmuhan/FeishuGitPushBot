@@ -88,11 +88,13 @@ type mergeSearch struct {
 // tryMergeWithExisting 尝试查找已有消息记录并合并/更新
 // search: 搜索条件
 // mergeFn: 合并策略，参数 (old, new *EventDetail)，可就地修改 new
+// headSHA: 非空时更新记录的 head_sha 字段（用于 push 合并后保持 SHA 关联）
 // 返回 (merged bool, err error)，merged=true 时调用方应立即返回
 func tryMergeWithExisting(
 	ctx context.Context,
 	search mergeSearch,
 	mergeFn func(old, new *EventDetail),
+	headSHA string,
 	detail *EventDetail,
 	repo, repoUrl, sender, senderUrl, avatarUrl, logMsg string,
 ) (bool, error) {
@@ -133,11 +135,15 @@ func tryMergeWithExisting(
 
 	// 更新数据库记录
 	detailJson, _ := json.Marshal(detail)
-	_, _ = DB.NewUpdate().Model(&record).
+	updateQ := DB.NewUpdate().Model(&record).
 		Set("content = ?", string(detailJson)).
 		Set("card_string = ?", card.String()).
 		Set("updated_at = ?", time.Now()).
-		WherePK().Exec(ctx)
+		WherePK()
+	if headSHA != "" {
+		updateQ = updateQ.Set("head_sha = ?", headSHA)
+	}
+	_, _ = updateQ.Exec(ctx)
 
 	slog.Info(logMsg, "github_id", record.GithubID)
 	return true, nil
@@ -170,20 +176,20 @@ func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) {
 	}
 }
 
-// findParentBySHA 根据 commit SHA 查找同一仓库下的推送消息
-func findParentBySHA(ctx context.Context, repo, sha string) string {
+// findParentRecordBySHA 根据 commit SHA 查找同一仓库下 push/create 事件的消息记录
+func findParentRecordBySHA(ctx context.Context, repo, sha string) *MessageRecord {
 	if sha == "" || repo == "" {
-		return ""
+		return nil
 	}
 	var record MessageRecord
 	if err := DB.NewSelect().Model(&record).
 		Where("repo_name = ?", repo).
-		Where("github_id LIKE ? OR (event_type = 'push' AND content LIKE ?)",
-			"%"+sha+"%", "%"+sha+"%").
+		Where("event_type IN ('push', 'create')").
+		Where("head_sha = ?", sha).
 		Order("id ASC").Limit(1).Scan(ctx); err == nil {
-		return record.FeishuMessageID
+		return &record
 	}
-	return ""
+	return nil
 }
 
 // findRecentRepoPush 查找同一仓库最近的推送消息（用于 tag/workflow 关联 commit）
@@ -379,7 +385,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		merged, err := tryMergeWithExisting(ctx,
 			mergeSearch{githubID: githubID, eventType: "release"},
 			func(_, new *EventDetail) {}, // Release 直接替换，无需合并
-			&detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Release card updated",
 		)
 		if merged {
@@ -393,9 +399,9 @@ func processWebhookEvent(event WebhookEvent) error {
 			mergeSearch{githubID: githubID, withinWindow: true},
 			func(old, new *EventDetail) {
 				new.Text = old.Text + "\n" + new.Text
-				new.Title = "🍏 Branch Push (Merged)"
+				new.Title = "🍏 Branch Push"
 			},
-			&detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			sha, &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Push merged",
 		)
 		if merged {
@@ -413,7 +419,7 @@ func processWebhookEvent(event WebhookEvent) error {
 				}
 				new.Title = "🗑️ Tags Deleted (Merged)"
 			},
-			&detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Tag deletions merged",
 		)
 		if merged {
@@ -431,7 +437,7 @@ func processWebhookEvent(event WebhookEvent) error {
 				}
 				new.Title = "🏷️ New Tags (Merged)"
 			},
-			&detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Tag creations merged",
 		)
 		if merged {
@@ -443,19 +449,37 @@ func processWebhookEvent(event WebhookEvent) error {
 	var parentID string
 	if event.EventType == "create" && detail.IsTag {
 		if sha != "" {
-			parentID = findParentBySHA(ctx, repo, sha)
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				parentID = rec.FeishuMessageID
+			}
 		}
 		if parentID == "" {
 			parentID = findRecentRepoPush(ctx, repo)
 		}
 	}
 	if isCIEvent && parentID == "" {
-		// CI 事件未找到已有记录（否则已在 4.1 返回），尝试关联到最近的 commit
+		// CI 事件未找到已有记录（否则已在 4.1 返回），通过 head_sha 精确关联 push 事件
 		if sha != "" {
-			parentID = findParentBySHA(ctx, repo, sha)
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				parentID = rec.FeishuMessageID
+			}
 		}
-		if parentID == "" {
-			parentID = findRecentRepoPush(ctx, repo)
+		// 找不到父消息，检查关联的 push 事件是否还在队列中或等待重试（事件到达顺序不确定）
+		if parentID == "" && ext(m, "action") == "requested" && sha != "" {
+			var pendingPush WebhookEvent
+			if err := DB.NewSelect().Model(&pendingPush).
+				Where("event_type = ?", "push").
+				Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
+				Where("payload LIKE ?", "%"+sha+"%").
+				Limit(1).Scan(ctx); err == nil {
+				// 改回 pending 重新排队，不增加 retry_count，避免耗尽重试次数
+				slog.Info("Rescheduling CI event, waiting for push", "sha", sha, "event_type", event.EventType)
+				_, _ = DB.NewUpdate().Model(&event).
+					Set("status = ?", "pending").
+					Set("updated_at = ?", time.Now()).
+					WherePK().Exec(ctx)
+				return nil
+			}
 		}
 	}
 
@@ -473,16 +497,9 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	action := ext(m, "action")
 	if isInteraction && action != "opened" {
-		commitId := sha // 使用已经提取好的 sha
-		if parentID == "" && commitId != "" {
-			var record MessageRecord
-			// 始终按 ID 升序取第一条 (Root message)
-			// 优化：增加对 push 记录 content 的模糊匹配，因为 push 记录的 github_id 不含 SHA
-			if err := DB.NewSelect().Model(&record).
-				Where("github_id LIKE ? OR (event_type = 'push' AND repo_name = ? AND content LIKE ?)",
-					"%"+commitId+"%", repo, "%"+commitId+"%").
-				Order("id ASC").Limit(1).Scan(ctx); err == nil {
-				parentID = record.FeishuMessageID
+		if parentID == "" && sha != "" {
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				parentID = rec.FeishuMessageID
 			}
 		}
 		if parentID == "" {
@@ -588,6 +605,12 @@ func processWebhookEvent(event WebhookEvent) error {
 			}
 		}
 
+		// push/create 事件：记录 head SHA 供后续 CI/tag 精确关联
+		headSHA := ""
+		if event.EventType == "push" || event.EventType == "create" {
+			headSHA = sha
+		}
+
 		_, _ = DB.NewInsert().Model(&MessageRecord{
 			GithubID:          githubID,
 			FeishuMessageID:   msgID,
@@ -601,6 +624,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			AvatarURL:         avatarUrl,
 			EventID:           event.ID,
 			WorkflowStartedAt: workflowStartedAt,
+			HeadSHA:           headSHA,
 		}).Exec(ctx)
 	}
 
