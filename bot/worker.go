@@ -482,6 +482,9 @@ func processWebhookEvent(event WebhookEvent) error {
 				Order("CASE event_type WHEN 'create' THEN 0 ELSE 1 END, id ASC").
 				Limit(1).Scan(ctx); err == nil {
 				parentID = record.FeishuMessageID
+				slog.Info("CI event found parent by head_sha", "sha", sha, "parent_event", record.EventType, "parent_id", parentID)
+			} else {
+				slog.Warn("CI event: no parent found by head_sha", "sha", sha, "repo", repo, "error", err)
 			}
 		}
 		// 找不到父消息，检查关联的 push 事件是否还在队列中或等待重试（事件到达顺序不确定）
@@ -629,6 +632,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		headSHA := ""
 		if event.EventType == "push" || event.EventType == "create" {
 			headSHA = sha
+			slog.Info("Storing head_sha for event", "event_type", event.EventType, "head_sha", headSHA, "repo", repo)
 		}
 
 		_, _ = DB.NewInsert().Model(&MessageRecord{
