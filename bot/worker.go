@@ -281,6 +281,19 @@ func processWebhookEvent(event WebhookEvent) error {
 	if sha == "" {
 		sha = ext(m, "check_suite", "head_sha")
 	}
+	// create 事件（tag 创建）payload 不含 SHA，从已入库的同标签 push 事件获取
+	if sha == "" && event.EventType == "create" && ext(m, "ref_type") == "tag" {
+		tagName := ext(m, "ref")
+		var pushRecord MessageRecord
+		if err := DB.NewSelect().Model(&pushRecord).
+			Where("repo_name = ?", repo).
+			Where("event_type = ?", "push").
+			Where("ref = ?", "refs/tags/"+tagName).
+			Where("head_sha != ''").
+			Order("id DESC").Limit(1).Scan(ctx); err == nil {
+			sha = pushRecord.HeadSHA
+		}
+	}
 
 	// 3. 构建追踪 ID
 	var githubID string
@@ -458,10 +471,17 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 	if isCIEvent && parentID == "" {
-		// CI 事件未找到已有记录（否则已在 4.1 返回），通过 head_sha 精确关联 push 事件
+		// CI 事件未找到已有记录（否则已在 4.1 返回），通过 head_sha 精确关联
+		// 优先关联 tag 消息（create 事件），其次才是 push 消息
 		if sha != "" {
-			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
-				parentID = rec.FeishuMessageID
+			var record MessageRecord
+			if err := DB.NewSelect().Model(&record).
+				Where("repo_name = ?", repo).
+				Where("event_type IN ('push', 'create')").
+				Where("head_sha = ?", sha).
+				Order("CASE event_type WHEN 'create' THEN 0 ELSE 1 END, id ASC").
+				Limit(1).Scan(ctx); err == nil {
+				parentID = record.FeishuMessageID
 			}
 		}
 		// 找不到父消息，检查关联的 push 事件是否还在队列中或等待重试（事件到达顺序不确定）
@@ -626,6 +646,20 @@ func processWebhookEvent(event WebhookEvent) error {
 			WorkflowStartedAt: workflowStartedAt,
 			HeadSHA:           headSHA,
 		}).Exec(ctx)
+
+		// push 事件入库后，回填同标签 create 事件的 head_sha（create 可能先于 push 处理）
+		if event.EventType == "push" && detail.IsTag && sha != "" {
+			tagName := strings.TrimPrefix(ref, "refs/tags/")
+			if tagName != ref {
+				_, _ = DB.NewUpdate().Model((*MessageRecord)(nil)).
+					Set("head_sha = ?", sha).
+					Where("repo_name = ?", repo).
+					Where("event_type = ?", "create").
+					Where("ref = ?", tagName).
+					Where("head_sha = ''").
+					Exec(ctx)
+			}
+		}
 	}
 
 	return nil
