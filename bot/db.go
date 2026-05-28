@@ -34,6 +34,9 @@ type MessageRecord struct {
 	// 关联原始事件 (新增)
 	EventID uint64 `bun:",notnull"`
 
+	// push/create 事件：记录 head commit SHA，用于 CI/tag 精确关联
+	HeadSHA string `bun:""`
+
 	// 新增：图片状态，用于后台刷新
 	ImageStatus string `bun:",default:'done'"` // done, pending
 	AvatarURL   string `bun:""`                // 原始头像 URL
@@ -117,6 +120,7 @@ func migrateDB(db *bun.DB) {
 	migrations := []migration{
 		// MessageRecord
 		{"message_records", "event_id", "BIGINT NOT NULL DEFAULT 0"},
+		{"message_records", "head_sha", "TEXT"},
 		{"message_records", "image_status", "TEXT DEFAULT 'done'"},
 		{"message_records", "avatar_url", "TEXT"},
 		{"message_records", "workflow_started_at", "TIMESTAMPTZ"},
