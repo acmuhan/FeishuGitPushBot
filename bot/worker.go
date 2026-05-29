@@ -890,7 +890,14 @@ func processWebhookEvent(event WebhookEvent) error {
 			Sender:            sender,
 			SenderURL:         senderUrl,
 			AvatarURL2:        avatarUrl,
-		}).Exec(ctx)
+		}).On("CONFLICT (github_id) DO UPDATE").
+			Set("feishu_message_id = EXCLUDED.feishu_message_id").
+			Set("content = EXCLUDED.content").
+			Set("card_string = EXCLUDED.card_string").
+			Set("event_id = EXCLUDED.event_id").
+			Set("updated_at = NOW()").
+			Set("head_sha = CASE WHEN EXCLUDED.head_sha != '' THEN EXCLUDED.head_sha ELSE message_records.head_sha END").
+			Exec(ctx)
 
 		// push 事件入库后，回填同标签 create 事件的 head_sha（create 可能先于 push 处理）
 		if event.EventType == "push" && detail.IsTag && sha != "" {
