@@ -552,7 +552,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		merged, err := tryMergeWithExisting(ctx,
 			mergeSearch{githubID: githubID, withinWindow: true},
 			func(old, new *EventDetail) {
-				new.Text = old.Text + "\n" + new.Text
+				new.Text = old.Text + "\n---\n" + new.Text
 				new.Title = "🍏 Branch Push"
 				new.EventCount = len(strings.Split(new.Text, "\n"))
 				currentTime := new.EventTime
@@ -580,7 +580,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			mergeSearch{githubIDLike: fmt.Sprintf("push:%s:refs/heads/%%", repo), recordType: "deleted", withinWindow: true},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
-					new.Text = old.Text + "\n" + new.Text
+					new.Text = old.Text + "\n---\n" + new.Text
 				}
 				new.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repo)
 				new.RefName = ""
@@ -605,7 +605,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			mergeSearch{githubIDLike: fmt.Sprintf("delete:%s:tag:%%", repo), withinWindow: true},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
-					new.Text = old.Text + "\n" + new.Text
+					new.Text = old.Text + "\n---\n" + new.Text
 				}
 				new.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", repo)
 				new.RefName = ""
@@ -630,7 +630,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			mergeSearch{githubIDLike: fmt.Sprintf("create:%s:tag:%%", repo), withinWindow: true},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
-					new.Text = old.Text + "\n" + new.Text
+					new.Text = old.Text + "\n---\n" + new.Text
 				}
 				new.Title = fmt.Sprintf("🏷️ New Tag: %s", repo)
 				new.RefName = ""
