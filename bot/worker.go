@@ -59,11 +59,16 @@ func messageWorker() {
 				Set("updated_at = ?", time.Now()).
 				WherePK().Exec(context.Background())
 		} else {
-			// 处理成功，标记已处理
-			_, _ = DB.NewUpdate().Model(&event).
-				Set("status = ?", "processed").
-				Set("updated_at = ?", time.Now()).
-				WherePK().Exec(context.Background())
+			// 检查事件是否已被 processWebhookEvent 重新排队（如 CI reschedule）
+			var current WebhookEvent
+			if err := DB.NewSelect().Model(&current).Where("id = ?", event.ID).Column("status").Scan(context.Background()); err == nil && current.Status == "pending" {
+				// 已被重新排队，跳过 processed 标记
+			} else {
+				_, _ = DB.NewUpdate().Model(&event).
+					Set("status = ?", "processed").
+					Set("updated_at = ?", time.Now()).
+					WherePK().Exec(context.Background())
+			}
 		}
 
 		// 推送间隔，保证节奏
@@ -207,7 +212,7 @@ func findRecentRepoPush(ctx context.Context, repo string) string {
 	var record MessageRecord
 	if err := DB.NewSelect().Model(&record).
 		Where("repo_name = ?", repo).
-		Where("event_type = ? OR event_type = ?", "push", "create").
+		Where("event_type IN ('push', 'create')").
 		Where("record_type != 'deleted'").
 		Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
 		Order("id DESC").Limit(1).Scan(ctx); err == nil {
@@ -230,6 +235,10 @@ func updateParentCardWithCI(ctx context.Context, parentMsgID string) {
 	}
 	var parentDetail EventDetail
 	_ = json.Unmarshal([]byte(parentRecord.Content), &parentDetail)
+	// 兼容旧记录：回填 RepoURL
+	if parentDetail.RepoURL == "" && parentRecord.RepoName != "" {
+		parentDetail.RepoURL = fmt.Sprintf("https://github.com/%s", parentRecord.RepoName)
+	}
 
 	// 查询所有关联的 CI 记录
 	statuses := getCIStatusesForParent(ctx, parentMsgID)
@@ -307,7 +316,7 @@ func detectPRMerge(ctx context.Context, event WebhookEvent, m map[string]any, de
 		Set("updated_at = ?", time.Now()).
 		WherePK().Exec(ctx)
 
-	slog.Info("PR merge detected, commits added to PR card", "pr", prGithubID, "commits", len(detail.Text))
+	slog.Info("PR merge detected, commits added to PR card", "pr", prGithubID)
 
 	// 回填 head_sha 到 PR 记录
 	if sha != "" {
@@ -540,12 +549,11 @@ func processWebhookEvent(event WebhookEvent) error {
 				new.Text = old.Text + "\n" + new.Text
 				new.Title = "🍏 Branch Push"
 				new.EventCount = len(strings.Split(new.Text, "\n"))
+				currentTime := new.EventTime
 				if old.EventTime != "" {
 					new.EventTime = old.EventTime // 保留最早时间
 				}
-				if new.EventTimeEnd == "" {
-					new.EventTimeEnd = new.EventTime
-				}
+				new.EventTimeEnd = currentTime // 最新事件时间作为结束时间
 			},
 			sha, &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Push combined",
@@ -569,13 +577,13 @@ func processWebhookEvent(event WebhookEvent) error {
 					new.Text = old.Text + "\n" + new.Text
 				}
 				new.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repo)
-				// 合并后清空 RefName/RefURL，避免摘要行显示过时的单个分支名
 				new.RefName = ""
 				new.RefURL = ""
+				currentTime := new.EventTime
 				if old.EventTime != "" {
-					new.EventTime = old.EventTime // 保留最早时间
+					new.EventTime = old.EventTime
 				}
-				new.EventTimeEnd = new.EventTime
+				new.EventTimeEnd = currentTime
 			},
 			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Branch deletions combined",
@@ -596,10 +604,11 @@ func processWebhookEvent(event WebhookEvent) error {
 				new.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", repo)
 				new.RefName = ""
 				new.RefURL = ""
+				currentTime := new.EventTime
 				if old.EventTime != "" {
-					new.EventTime = old.EventTime // 保留最早时间
+					new.EventTime = old.EventTime
 				}
-				new.EventTimeEnd = new.EventTime
+				new.EventTimeEnd = currentTime
 			},
 			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Tag deletions combined",
@@ -620,10 +629,11 @@ func processWebhookEvent(event WebhookEvent) error {
 				new.Title = fmt.Sprintf("🏷️ New Tag: %s", repo)
 				new.RefName = ""
 				new.RefURL = ""
+				currentTime := new.EventTime
 				if old.EventTime != "" {
-					new.EventTime = old.EventTime // 保留最早时间
+					new.EventTime = old.EventTime
 				}
-				new.EventTimeEnd = new.EventTime
+				new.EventTimeEnd = currentTime
 			},
 			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Tag creations combined",

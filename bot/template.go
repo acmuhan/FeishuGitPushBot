@@ -930,6 +930,35 @@ func extractPRNumber(msg string) string {
 	return ""
 }
 
+// parseRunIDFromURL 从 GitHub Actions URL 中解析 run ID
+// URL 格式: https://github.com/owner/repo/actions/runs/123456
+func parseRunIDFromURL(url string) int64 {
+	if url == "" {
+		return 0
+	}
+	// 查找 /runs/ 后的数字
+	idx := strings.LastIndex(url, "/runs/")
+	if idx < 0 {
+		return 0
+	}
+	remaining := url[idx+6:]
+	// 提取连续数字
+	var numStr string
+	for _, c := range remaining {
+		if c >= '0' && c <= '9' {
+			numStr += string(c)
+		} else {
+			break
+		}
+	}
+	if numStr == "" {
+		return 0
+	}
+	var id int64
+	fmt.Sscanf(numStr, "%d", &id)
+	return id
+}
+
 // getCIStatusesForParent 查询关联到指定父消息的所有 CI 事件状态
 // 从每条 CI 记录的 EventDetail 构造 CIStatus（CI 记录不单独存储 CIStatuses）
 func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus {
@@ -981,6 +1010,7 @@ func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus 
 				WorkflowName: workflowName,
 				Status:       status,
 				Conclusion:   conclusion,
+				RunID:        parseRunIDFromURL(detail.URL),
 				Duration:     duration,
 				UpdatedAt:    r.UpdatedAt.Format(time.RFC3339),
 			})
@@ -1075,6 +1105,9 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	card.Header.Title = CardText{Tag: "plain_text", Content: detail.Title}
 	card.Header.Template = GetTemplate(detail.Title)
 	repoUrl := detail.RepoURL
+	if repoUrl == "" && repo != "" {
+		repoUrl = fmt.Sprintf("https://github.com/%s", repo)
+	}
 
 	// --- 1. 摘要信息行：仓库 / 分支 / 提交人（含头像） ---
 	repoPart := ""
