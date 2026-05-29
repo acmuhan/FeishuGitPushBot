@@ -1112,8 +1112,6 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	// 删除事件：标题改为仓库名，避免冗余
 	if detail.IsDeleted && repo != "" {
 		card.Header.Title = CardText{Tag: "plain_text", Content: fmt.Sprintf("%s: %s", strings.SplitN(detail.Title, ":", 2)[0], repo)}
-		// 简化 body：不显示冗余的仓库/分支摘要行，RefName 清空
-		detail.RefName = ""
 	}
 
 	// --- 1. 摘要信息行：仓库 / 分支 / 提交人（含头像） ---
@@ -1230,6 +1228,14 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 			})
 		} else {
 			card.AddMarkdown(content)
+		}
+		// 删除事件也加 View Details 按钮
+		btnURL := repoUrl
+		if detail.URL != "" {
+			btnURL = detail.URL
+		}
+		if btnURL != "" {
+			card.AddActions("flow", ActionButton{Text: "View Details", URL: btnURL, Type: "default"})
 		}
 	} else {
 
