@@ -1313,11 +1313,6 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 			remaining := strings.Join(lines[3:], "\n")
 			card.AddMarkdown(visible)
 			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(lines)-3), remaining)
-		} else if len([]rune(detail.Text)) > 600 {
-			// 内容过长时截断摘要，完整内容放入折叠面板
-			summary := truncateAtLine(detail.Text, 300)
-			card.AddMarkdown(summary)
-			card.AddCollapsiblePanel("", detail.Text)
 		} else {
 			card.AddMarkdown(detail.Text)
 		}
