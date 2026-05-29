@@ -59,11 +59,16 @@ func messageWorker() {
 				Set("updated_at = ?", time.Now()).
 				WherePK().Exec(context.Background())
 		} else {
-			// 处理成功，标记已处理
-			_, _ = DB.NewUpdate().Model(&event).
-				Set("status = ?", "processed").
-				Set("updated_at = ?", time.Now()).
-				WherePK().Exec(context.Background())
+			// 检查事件是否已被 processWebhookEvent 重新排队（如 CI reschedule）
+			var current WebhookEvent
+			if err := DB.NewSelect().Model(&current).Where("id = ?", event.ID).Column("status").Scan(context.Background()); err == nil && current.Status == "pending" {
+				// 已被重新排队，跳过 processed 标记
+			} else {
+				_, _ = DB.NewUpdate().Model(&event).
+					Set("status = ?", "processed").
+					Set("updated_at = ?", time.Now()).
+					WherePK().Exec(context.Background())
+			}
 		}
 
 		// 推送间隔，保证节奏
@@ -77,11 +82,12 @@ func getMergeWindow() time.Duration {
 }
 
 // mergeSearch 定义查找已有消息记录的搜索条件
-// githubID 和 githubIDLike 为 OR 关系，eventType 和 withinWindow 为 AND 关系
+// githubID 和 githubIDLike 为 OR 关系，eventType / withinWindow / recordType 为 AND 关系
 type mergeSearch struct {
 	githubID     string // github_id 精确匹配
 	githubIDLike string // github_id LIKE 模式匹配
 	eventType    string // event_type 精确匹配（空值表示不筛选）
+	recordType   string // record_type 精确匹配（空值表示不筛选）
 	withinWindow bool   // 是否应用合并窗口时间过滤
 }
 
@@ -111,6 +117,9 @@ func tryMergeWithExisting(
 	if search.eventType != "" {
 		q = q.Where("event_type = ?", search.eventType)
 	}
+	if search.recordType != "" {
+		q = q.Where("record_type = ?", search.recordType)
+	}
 	if search.withinWindow {
 		q = q.Where("updated_at > ?", time.Now().Add(-getMergeWindow()))
 	}
@@ -126,7 +135,7 @@ func tryMergeWithExisting(
 
 	// 构建并更新卡片
 	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
-	card := BuildCard(buildCtx, repo, repoUrl, sender, senderUrl, avatarUrl, *detail)
+	card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, *detail)
 	buildCancel()
 
 	if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
@@ -177,6 +186,7 @@ func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) {
 }
 
 // findParentRecordBySHA 根据 commit SHA 查找同一仓库下 push/create 事件的消息记录
+// 排除已删除的消息记录，避免 CI 事件错误关联到分支删除记录
 func findParentRecordBySHA(ctx context.Context, repo, sha string) *MessageRecord {
 	if sha == "" || repo == "" {
 		return nil
@@ -186,6 +196,7 @@ func findParentRecordBySHA(ctx context.Context, repo, sha string) *MessageRecord
 		Where("repo_name = ?", repo).
 		Where("event_type IN ('push', 'create')").
 		Where("head_sha = ?", sha).
+		Where("record_type != 'deleted'").
 		Order("id ASC").Limit(1).Scan(ctx); err == nil {
 		return &record
 	}
@@ -193,6 +204,7 @@ func findParentRecordBySHA(ctx context.Context, repo, sha string) *MessageRecord
 }
 
 // findRecentRepoPush 查找同一仓库最近的推送消息（用于 tag/workflow 关联 commit）
+// 排除已删除的消息记录
 func findRecentRepoPush(ctx context.Context, repo string) string {
 	if repo == "" {
 		return ""
@@ -200,7 +212,8 @@ func findRecentRepoPush(ctx context.Context, repo string) string {
 	var record MessageRecord
 	if err := DB.NewSelect().Model(&record).
 		Where("repo_name = ?", repo).
-		Where("event_type = ? OR event_type = ?", "push", "create").
+		Where("event_type IN ('push', 'create')").
+		Where("record_type != 'deleted'").
 		Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
 		Order("id DESC").Limit(1).Scan(ctx); err == nil {
 		return record.FeishuMessageID
@@ -208,8 +221,115 @@ func findRecentRepoPush(ctx context.Context, repo string) string {
 	return ""
 }
 
+// updateParentCardWithCI 查询父消息关联的所有 CI 状态，更新父消息卡片
+func updateParentCardWithCI(ctx context.Context, parentMsgID string) {
+	if parentMsgID == "" || DB == nil {
+		return
+	}
+	var parentRecord MessageRecord
+	if err := DB.NewSelect().Model(&parentRecord).
+		Where("feishu_message_id = ?", parentMsgID).
+		Where("event_type NOT IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
+		Order("id ASC").Limit(1).Scan(ctx); err != nil {
+		return
+	}
+	var parentDetail EventDetail
+	_ = json.Unmarshal([]byte(parentRecord.Content), &parentDetail)
+	// 兼容旧记录：回填 RepoURL
+	if parentDetail.RepoURL == "" && parentRecord.RepoName != "" {
+		parentDetail.RepoURL = fmt.Sprintf("https://github.com/%s", parentRecord.RepoName)
+	}
+
+	// 查询所有关联的 CI 记录
+	statuses := getCIStatusesForParent(ctx, parentMsgID)
+	parentDetail.CIStatuses = statuses
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+	card := BuildCard(buildCtx, parentRecord.RepoName, parentRecord.Sender, parentRecord.SenderURL, parentRecord.AvatarURL2, parentDetail)
+	buildCancel()
+
+	if err := UpdateMessage(parentMsgID, card); err != nil {
+		slog.Error("Failed to update parent card with CI status", "parent", parentMsgID, "error", err)
+		return
+	}
+	detailJson, _ := json.Marshal(parentDetail)
+	_, _ = DB.NewUpdate().Model(&parentRecord).
+		Set("content = ?", string(detailJson)).
+		Set("card_string = ?", card.String()).
+		Set("updated_at = ?", time.Now()).
+		WherePK().Exec(ctx)
+}
+
+// detectPRMerge 检测 push 是否为 PR 合并，如果是则更新 PR 卡片而非创建新的 push 消息
+// 返回 true 表示已处理（调用方应立即返回）
+func detectPRMerge(ctx context.Context, event WebhookEvent, m map[string]any, detail *EventDetail,
+	repo, repoUrl, sender, senderUrl, avatarUrl, sha string) bool {
+	if event.EventType != "push" || detail.IsTag || detail.IsDeleted {
+		return false
+	}
+	hc, _ := m["head_commit"].(map[string]any)
+	if hc == nil {
+		return false
+	}
+	msg, _ := hc["message"].(string)
+	prNum := extractPRNumber(msg)
+	if prNum == "" {
+		return false
+	}
+
+	// 查找对应的 PR 消息记录
+	prGithubID := fmt.Sprintf("pr:%s:%s", repo, prNum)
+	var prRecord MessageRecord
+	if err := DB.NewSelect().Model(&prRecord).
+		Where("github_id = ?", prGithubID).
+		Order("id DESC").Limit(1).Scan(ctx); err != nil {
+		return false
+	}
+
+	// 合并 commit 信息到 PR 卡片
+	var prDetail EventDetail
+	_ = json.Unmarshal([]byte(prRecord.Content), &prDetail)
+	if detail.Text != "" {
+		if prDetail.Text != "" {
+			prDetail.Text += "\n"
+		}
+		prDetail.Text += detail.Text
+	}
+	if detail.EventTime != "" {
+		prDetail.EventTimeEnd = detail.EventTime
+	}
+	prDetail.RepoURL = repoUrl
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+	card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, prDetail)
+	buildCancel()
+
+	if err := UpdateMessage(prRecord.FeishuMessageID, card); err != nil {
+		slog.Error("Failed to update PR card with merge commits", "pr", prGithubID, "error", err)
+		return false
+	}
+
+	detailJson, _ := json.Marshal(prDetail)
+	_, _ = DB.NewUpdate().Model(&prRecord).
+		Set("content = ?", string(detailJson)).
+		Set("card_string = ?", card.String()).
+		Set("updated_at = ?", time.Now()).
+		WherePK().Exec(ctx)
+
+	slog.Info("PR merge detected, commits added to PR card", "pr", prGithubID)
+
+	// 回填 head_sha 到 PR 记录
+	if sha != "" {
+		_, _ = DB.NewUpdate().Model(&prRecord).
+			Set("head_sha = ?", sha).
+			WherePK().Exec(ctx)
+	}
+	return true
+}
+
 func processWebhookEvent(event WebhookEvent) error {
 	ctx := context.Background()
+	var parentMsgID string // CI 事件关联的父消息 ID
 
 	// 1. 解析 Payload
 	payload := []byte(event.Payload)
@@ -234,6 +354,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	sender := ext(m, "sender", "login")
 	senderUrl := ext(m, "sender", "html_url")
 	avatarUrl := ext(m, "sender", "avatar_url")
+	detail.RepoName = repo    // 用于合并展示的仓库全名
+	detail.RepoURL = repoUrl  // 用于 BuildCard 构建链接
 	ref := ext(m, "ref")
 	// Workflow 事件的 ref 在 head_branch 中
 	if ref == "" {
@@ -372,9 +494,21 @@ func processWebhookEvent(event WebhookEvent) error {
 					WherePK().Exec(ctx)
 			}
 
-			// 更新原消息
+			if record.ParentMsgID != "" {
+				// CI 内联模式：更新 CI 记录，然后刷新父消息卡片
+				detailJson, _ := json.Marshal(detail)
+				_, _ = DB.NewUpdate().Model(&record).
+					Set("content = ?", string(detailJson)).
+					Set("updated_at = ?", time.Now()).
+					WherePK().Exec(ctx)
+				updateParentCardWithCI(ctx, record.ParentMsgID)
+				slog.Info("CI status updated (inline)", "github_id", githubID, "parent", record.ParentMsgID)
+				return nil
+			}
+
+			// 兼容旧模式：独立 CI 消息
 			buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
-			card := BuildCard(buildCtx, repo, repoUrl, sender, senderUrl, avatarUrl, detail)
+			card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
 			buildCancel()
 
 			if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
@@ -406,16 +540,53 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
-	// 4.3 分支推送合并：同一分支在合并窗口内的连续推送合并为一条
-	if event.EventType == "push" && githubID != "" && !detail.IsTag && detail.Text != "" {
+	// 4.3 分支推送合并：同一分支在合并窗口内的连续推送合并为一条（排除分支删除）
+	if event.EventType == "push" && githubID != "" && !detail.IsTag && !detail.IsDeleted && detail.Text != "" {
+		detail.EventCount = len(strings.Split(detail.Text, "\n"))
 		merged, err := tryMergeWithExisting(ctx,
 			mergeSearch{githubID: githubID, withinWindow: true},
 			func(old, new *EventDetail) {
 				new.Text = old.Text + "\n" + new.Text
 				new.Title = "🍏 Branch Push"
+				new.EventCount = len(strings.Split(new.Text, "\n"))
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime // 保留最早时间
+				}
+				new.EventTimeEnd = currentTime // 最新事件时间作为结束时间
 			},
 			sha, &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
-			"Push merged",
+			"Push combined",
+		)
+		if merged {
+			return err
+		}
+	}
+
+	// 4.3a PR 合并去重：push 是 PR merge 时，更新 PR 卡片而非创建新 push 消息
+	if detectPRMerge(ctx, event, m, &detail, repo, repoUrl, sender, senderUrl, avatarUrl, sha) {
+		return nil
+	}
+
+	// 4.3b 分支删除合并：同一仓库在合并窗口内的分支删除合并为一条
+	if event.EventType == "push" && detail.IsDeleted && !detail.IsTag {
+		merged, err := tryMergeWithExisting(ctx,
+			mergeSearch{githubIDLike: fmt.Sprintf("push:%s:refs/heads/%%", repo), recordType: "deleted", withinWindow: true},
+			func(old, new *EventDetail) {
+				if old.Text != "" {
+					new.Text = old.Text + "\n" + new.Text
+				}
+				new.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repo)
+				new.RefName = ""
+				new.RefURL = ""
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime
+				}
+				new.EventTimeEnd = currentTime
+			},
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"Branch deletions combined",
 		)
 		if merged {
 			return err
@@ -430,10 +601,17 @@ func processWebhookEvent(event WebhookEvent) error {
 				if old.Text != "" {
 					new.Text = old.Text + "\n" + new.Text
 				}
-				new.Title = "🗑️ Tags Deleted (Merged)"
+				new.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", repo)
+				new.RefName = ""
+				new.RefURL = ""
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime
+				}
+				new.EventTimeEnd = currentTime
 			},
 			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
-			"Tag deletions merged",
+			"Tag deletions combined",
 		)
 		if merged {
 			return err
@@ -448,10 +626,17 @@ func processWebhookEvent(event WebhookEvent) error {
 				if old.Text != "" {
 					new.Text = old.Text + "\n" + new.Text
 				}
-				new.Title = "🏷️ New Tags (Merged)"
+				new.Title = fmt.Sprintf("🏷️ New Tag: %s", repo)
+				new.RefName = ""
+				new.RefURL = ""
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime
+				}
+				new.EventTimeEnd = currentTime
 			},
 			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
-			"Tag creations merged",
+			"Tag creations combined",
 		)
 		if merged {
 			return err
@@ -472,23 +657,24 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 	if isCIEvent && parentID == "" {
 		// CI 事件未找到已有记录（否则已在 4.1 返回），通过 head_sha 精确关联
-		// 优先关联 tag 消息（create 事件），其次才是 push 消息
 		if sha != "" {
 			var record MessageRecord
 			if err := DB.NewSelect().Model(&record).
 				Where("repo_name = ?", repo).
 				Where("event_type IN ('push', 'create')").
 				Where("head_sha = ?", sha).
+				Where("record_type != 'deleted'").
 				Order("CASE event_type WHEN 'create' THEN 0 ELSE 1 END, id ASC").
 				Limit(1).Scan(ctx); err == nil {
 				parentID = record.FeishuMessageID
+				parentMsgID = record.FeishuMessageID
 				slog.Info("CI event found parent by head_sha", "sha", sha, "parent_event", record.EventType, "parent_id", parentID)
 			} else {
 				slog.Warn("CI event: no parent found by head_sha", "sha", sha, "repo", repo, "error", err)
 			}
 		}
 		// 找不到父消息，检查关联的 push 事件是否还在队列中或等待重试（事件到达顺序不确定）
-		if parentID == "" && ext(m, "action") == "requested" && sha != "" {
+		if parentID == "" && sha != "" && event.RescheduleCount < 5 {
 			var pendingPush WebhookEvent
 			if err := DB.NewSelect().Model(&pendingPush).
 				Where("event_type = ?", "push").
@@ -496,9 +682,10 @@ func processWebhookEvent(event WebhookEvent) error {
 				Where("payload LIKE ?", "%"+sha+"%").
 				Limit(1).Scan(ctx); err == nil {
 				// 改回 pending 重新排队，不增加 retry_count，避免耗尽重试次数
-				slog.Info("Rescheduling CI event, waiting for push", "sha", sha, "event_type", event.EventType)
+				slog.Info("Rescheduling CI event, waiting for push", "sha", sha, "event_type", event.EventType, "reschedule", event.RescheduleCount+1)
 				_, _ = DB.NewUpdate().Model(&event).
 					Set("status = ?", "pending").
+					Set("reschedule_count = reschedule_count + 1").
 					Set("updated_at = ?", time.Now()).
 					WherePK().Exec(ctx)
 				return nil
@@ -506,17 +693,53 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
+	// 4.7 CI 事件内联到父消息：保存 CI 记录并更新父消息卡片
+	if isCIEvent && parentMsgID != "" {
+		detailJson, _ := json.Marshal(detail)
+		workflowStartedAt := time.Time{}
+		status, conclusion := extractCIStatus(m, event.EventType)
+		if status == "in_progress" && conclusion == "" {
+			workflowStartedAt = time.Now()
+		}
+		if _, insertErr := DB.NewInsert().Model(&MessageRecord{
+			GithubID:          githubID,
+			FeishuMessageID:   parentMsgID, // 指向父消息，用于查询
+			ChatID:            C.Feishu.ChatID,
+			RepoName:          repo,
+			EventType:         event.EventType,
+			Content:           string(detailJson),
+			EventID:           event.ID,
+			WorkflowStartedAt: workflowStartedAt,
+			HeadSHA:           sha,
+			ParentMsgID:       parentMsgID,
+		}).Exec(ctx); insertErr != nil {
+			// GithubID 唯一约束处理幂等，其他错误记录日志
+			if !strings.Contains(insertErr.Error(), "duplicate key") {
+				slog.Error("Failed to insert CI record", "github_id", githubID, "error", insertErr)
+			}
+		}
+		updateParentCardWithCI(ctx, parentMsgID)
+		slog.Info("CI event inlined to parent", "github_id", githubID, "parent", parentMsgID)
+		return nil
+	}
+
+	// 4.8 CI 事件无父消息时的处理：in_progress 静默丢弃，仅 completed/failed 创建独立消息
+	if isCIEvent && parentMsgID == "" {
+		status, _ := extractCIStatus(m, event.EventType)
+		if status == "in_progress" || status == "queued" || status == "waiting" {
+			slog.Info("CI event suppressed (no parent, in_progress)", "github_id", githubID, "status", status)
+			return nil
+		}
+	}
+
 	// 5. 查找父级 ID (回复逻辑)
-	// 改为：只要是 Issue/PR/Workflow 相关的非”创建”事件，都尝试寻找父消息进行话题回复
+	// 改为：只要是 Issue/PR 相关的非"创建"事件，都尝试寻找父消息进行话题回复
+	// 注意：CI 事件不在这里处理，它们的父消息已在 4.6 通过 head_sha 精确关联
 	isInteraction := event.EventType == "issue_comment" ||
 		event.EventType == "pull_request_review_comment" ||
 		event.EventType == "pull_request_review" ||
 		event.EventType == "pull_request" ||
-		event.EventType == "issues" ||
-		event.EventType == "workflow_run" ||
-		event.EventType == "workflow_job" ||
-		event.EventType == "check_run" ||
-		event.EventType == "check_suite"
+		event.EventType == "issues"
 
 	action := ext(m, "action")
 	if isInteraction && action != "opened" {
@@ -589,7 +812,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// 此时 BuildCard 调用 GetImageKey 是纯内存/DB查询，刚才同步上传成功的会立即显示
-	card := BuildCard(ctx, repo, repoUrl, sender, senderUrl, avatarUrl, detail)
+	card := BuildCard(ctx, repo, sender, senderUrl, avatarUrl, detail)
 
 	var msgID string
 	var sendErr error
@@ -635,6 +858,12 @@ func processWebhookEvent(event WebhookEvent) error {
 			slog.Info("Storing head_sha for event", "event_type", event.EventType, "head_sha", headSHA, "repo", repo)
 		}
 
+		// 删除事件标记 record_type，用于合并查询
+		recordType := "normal"
+		if detail.IsDeleted {
+			recordType = "deleted"
+		}
+
 		_, _ = DB.NewInsert().Model(&MessageRecord{
 			GithubID:          githubID,
 			FeishuMessageID:   msgID,
@@ -649,6 +878,11 @@ func processWebhookEvent(event WebhookEvent) error {
 			EventID:           event.ID,
 			WorkflowStartedAt: workflowStartedAt,
 			HeadSHA:           headSHA,
+			RecordType:        recordType,
+			ParentMsgID:       parentMsgID,
+			Sender:            sender,
+			SenderURL:         senderUrl,
+			AvatarURL2:        avatarUrl,
 		}).Exec(ctx)
 
 		// push 事件入库后，回填同标签 create 事件的 head_sha（create 可能先于 push 处理）
@@ -758,10 +992,15 @@ func refreshOneImage(record MessageRecord) {
 	sender := ext(m, "sender", "login")
 	senderUrl := ext(m, "sender", "html_url")
 
+	// 确保 detail.RepoURL 已填充（兼容旧记录）
+	if detail.RepoURL == "" {
+		detail.RepoURL = repoUrl
+	}
+
 	// 4. 重建卡片，此时所有头像的 img_key 均已缓存（哪怕是刚才刚同步成功的）
 	buildCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	newCard := BuildCard(buildCtx, record.RepoName, repoUrl, sender, senderUrl, record.AvatarURL, detail)
+	newCard := BuildCard(buildCtx, record.RepoName, sender, senderUrl, record.AvatarURL, detail)
 
 	// 5. 核心优化：如果卡片内容（JSON）完全没变，则无需调用飞书 API 更新
 	if newCard.String() == record.CardString {

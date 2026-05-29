@@ -45,21 +45,33 @@ type MessageRecord struct {
 	WorkflowStartedAt time.Time `bun:",nullzero"`
 	// Workflow 专用：是否已经发送过超时提醒
 	TimeoutNotified bool `bun:",default:false"`
+
+	// 消息类型标识，用于区分正常消息和删除消息（支持合并查询）
+	RecordType string `bun:",default:'normal'"` // normal, deleted
+
+	// CI 事件：关联的父消息 ID（push/PR），用于内联 CI 状态到父消息卡片
+	ParentMsgID string `bun:""`
+
+	// 发送者元数据，用于重建卡片时保持一致
+	Sender     string `bun:""`
+	SenderURL  string `bun:""`
+	AvatarURL2 string `bun:""` // 原始发送者头像 URL（与 AvatarURL 区分，AvatarURL 用于图片刷新）
 }
 
 // WebhookEvent 存储所有来自 GitHub 的原始请求，持久化保存
 type WebhookEvent struct {
 	bun.BaseModel `bun:"table:webhook_events,alias:we"`
 
-	ID         uint64    `bun:",pk,autoincrement"`
-	DeliveryID string    `bun:",unique"`            // X-GitHub-Delivery 标头，用于幂等性检查
-	EventType  string    `bun:",notnull"`           // X-GitHub-Event 标头
-	HookID     int64     `bun:""`                   // X-GitHub-Hook-ID 标头
-	Payload    string    `bun:"type:text"`          // 原始 Webhook 负载
-	Status     string    `bun:",default:'pending'"` // pending, processed, failed
-	RetryCount int       `bun:",default:0"`
-	CreatedAt  time.Time `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt  time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	ID             uint64    `bun:",pk,autoincrement"`
+	DeliveryID     string    `bun:",unique"`            // X-GitHub-Delivery 标头，用于幂等性检查
+	EventType      string    `bun:",notnull"`           // X-GitHub-Event 标头
+	HookID         int64     `bun:""`                   // X-GitHub-Hook-ID 标头
+	Payload        string    `bun:"type:text"`          // 原始 Webhook 负载
+	Status         string    `bun:",default:'pending'"` // pending, processed, failed
+	RetryCount     int       `bun:",default:0"`
+	RescheduleCount int      `bun:",default:0"` // CI 事件等待 push 事件的重调度次数
+	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
 // ImageCache 图片缓存表，加速头像显示
@@ -125,8 +137,14 @@ func migrateDB(db *bun.DB) {
 		{"message_records", "avatar_url", "TEXT"},
 		{"message_records", "workflow_started_at", "TIMESTAMPTZ"},
 		{"message_records", "timeout_notified", "BOOLEAN DEFAULT FALSE"},
+		{"message_records", "record_type", "TEXT DEFAULT 'normal'"},
+		{"message_records", "parent_msg_id", "TEXT"},
+		{"message_records", "sender", "TEXT"},
+		{"message_records", "sender_url", "TEXT"},
+		{"message_records", "avatar_url2", "TEXT"},
 		// WebhookEvent
 		{"webhook_events", "hook_id", "BIGINT"},
+		{"webhook_events", "reschedule_count", "INT DEFAULT 0"},
 		// ImageCache
 		{"image_caches", "hash", "TEXT"},
 	}
