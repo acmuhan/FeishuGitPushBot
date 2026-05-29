@@ -98,7 +98,8 @@ func GithubHandler(c *gin.Context) {
 	sender := ext(m, "sender", "login")
 	senderUrl := ext(m, "sender", "html_url")
 	avatarUrl := ext(m, "sender", "avatar_url")
-	card := BuildCard(c.Request.Context(), repo, repoUrl, sender, senderUrl, avatarUrl, detail)
+	detail.RepoURL = repoUrl
+	card := BuildCard(c.Request.Context(), repo, sender, senderUrl, avatarUrl, detail)
 	if _, err := SendToChat("", card); err != nil {
 		slog.Error("Fallback send failed", "repo", repo, "event", eventType, "error", err)
 		c.AbortWithStatusJSON(500, gin.H{"code": 3, "msg": "failed to send message"})

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -22,12 +23,33 @@ type EventDetail struct {
 	FoldableBody  string   `json:"foldable_body"`
 	Skip          bool     `json:"skip"`
 	SHA           string   `json:"sha"`
+	FullSHA       string   `json:"full_sha"` // 完整 SHA，用于构建 commit 链接
 	IsTag         bool     `json:"is_tag"`
+	IsDeleted     bool     `json:"is_deleted"` // 分支/标签删除事件
 	AuthorAvatars []string `json:"author_avatars"` // 提交者或协作者的头像 URL 列表
 	AuthorLogins  []string `json:"author_logins"`  // 提交者或协作者的 login 列表（与 AuthorAvatars 顺序对应）
 	Action        string   `json:"action"`         // 事件具体动作
 	ExtraReply    string   `json:"extra_reply"`    // 需要另起一段话题回复的内容
 	EventTime     string   `json:"event_time"`     // GitHub 事件原始发生时间 (RFC3339)
+	RepoName      string   `json:"repo_name"`      // 仓库全名 (如 NCUHOME/repo)，用于合并展示
+	RepoURL       string   `json:"repo_url"`       // 仓库 HTML URL，用于 BuildCard 构建链接
+
+	// CI 状态：内联到触发事件的卡片中
+	CIStatuses []CIStatus `json:"ci_statuses,omitempty"`
+	// 合并事件：记录时间范围和数量
+	EventTimeEnd string `json:"event_time_end,omitempty"` // 合并事件的最后时间
+	EventCount   int    `json:"event_count,omitempty"`     // 合并事件中的条目数
+}
+
+// CIStatus 单条 CI/Workflow 运行状态
+type CIStatus struct {
+	WorkflowName string `json:"workflow_name"` // workflow 名称
+	Status       string `json:"status"`        // completed / in_progress / queued / ...
+	Conclusion   string `json:"conclusion"`    // success / failure / cancelled / ...
+	RunID        int64  `json:"run_id"`        // GitHub workflow run ID，用于构建链接
+	Ref          string `json:"ref"`           // 分支名
+	Duration     string `json:"duration"`      // 格式化后的耗时
+	UpdatedAt    string `json:"updated_at"`    // 最后更新时间 (RFC3339)
 }
 
 // ParseEvent 解析 GitHub 事件为极简明了的 Detail
@@ -191,17 +213,20 @@ func ParseEvent(event any, eventType string) EventDetail {
 		} else if e.GetDeleted() {
 			if isTag {
 				d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", refShort)
+				d.IsDeleted = true
 			} else {
 				d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", refShort)
+				d.IsDeleted = true
 			}
-			d.Text = ""
+			d.Text = fmt.Sprintf("🌿 %s", refShort)
 		} else if e.GetCreated() {
 			if isTag {
 				d.Title = fmt.Sprintf("🏷️ New Tag: %s", refShort)
+				d.Text = fmt.Sprintf("🏷️ %s", refShort)
 			} else {
 				d.Title = fmt.Sprintf("🆕 New Branch: %s", refShort)
+				d.Text = ""
 			}
-			d.Text = ""
 		} else if isTag {
 			// Tag 推送但没有 commits（可能是已有 tag 的更新）
 			d.Title = fmt.Sprintf("🏷️ Tag: %s", refShort)
@@ -210,6 +235,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		if hc := e.GetHeadCommit(); hc != nil {
 			d.URL = hc.GetURL()
 			sha := hc.GetID()
+			d.FullSHA = sha
 			if len(sha) > 7 {
 				d.SHA = sha[:7]
 			} else {
@@ -662,7 +688,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 				d.URL = d.RefURL
 			}
 			d.IsTag = true
-			d.Text = fmt.Sprintf("• 🏷️ %s", ref)
+			d.Text = fmt.Sprintf("🏷️ %s", ref)
 		} else {
 			// 分支创建通常由 Push 事件处理，这里跳过
 			d.Skip = true
@@ -674,7 +700,8 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", ref)
 			d.RefName = ref
 			d.IsTag = true
-			d.Text = fmt.Sprintf("• 🗑️ %s", ref)
+			d.IsDeleted = true
+			d.Text = fmt.Sprintf("🗑️ %s", ref)
 		} else {
 			d.Skip = true
 		}
@@ -894,11 +921,160 @@ func GetTemplate(title string) string {
 	return string(cardColorBlue)
 }
 
+// extractPRNumber 从 commit message 中提取 PR 编号（匹配 "Merge pull request #N" 模式）
+func extractPRNumber(msg string) string {
+	matches := prMergeRegex.FindStringSubmatch(msg)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+// getCIStatusesForParent 查询关联到指定父消息的所有 CI 事件状态
+// 从每条 CI 记录的 EventDetail 构造 CIStatus（CI 记录不单独存储 CIStatuses）
+func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus {
+	if DB == nil || parentMsgID == "" {
+		return nil
+	}
+	var records []MessageRecord
+	if err := DB.NewSelect().Model(&records).
+		Where("parent_msg_id = ?", parentMsgID).
+		Where("event_type IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
+		Order("id DESC"). // 最新的优先，去重时保留最新状态
+		Scan(ctx); err != nil {
+		return nil
+	}
+	var statuses []CIStatus
+	seen := make(map[string]bool)
+	for _, r := range records {
+		var detail EventDetail
+		_ = json.Unmarshal([]byte(r.Content), &detail)
+		// 从 EventDetail 的 Title 提取 CI 状态信息
+		// Title 格式: "✅ Workflow Succeeded: CI" / "❌ Workflow Failed: CI" / "✅ Check: lint"
+		workflowName := ""
+		titleParts := strings.SplitN(detail.Title, ": ", 2)
+		if len(titleParts) > 1 {
+			workflowName = titleParts[1]
+		} else {
+			workflowName = detail.Title
+		}
+		conclusion := ""
+		status := "completed"
+		if strings.Contains(detail.Title, "✅") {
+			conclusion = "success"
+		} else if strings.Contains(detail.Title, "❌") {
+			conclusion = "failure"
+		} else if strings.Contains(detail.Title, "⏳") {
+			status = "in_progress"
+		} else if strings.Contains(detail.Title, "⚙️") {
+			status = "in_progress"
+		}
+		key := workflowName
+		if !seen[key] {
+			seen[key] = true
+			// 从 Text 中提取耗时信息
+			duration := ""
+			if idx := strings.Index(detail.Text, " in "); idx >= 0 {
+				duration = strings.TrimSpace(detail.Text[idx+4:])
+			}
+			statuses = append(statuses, CIStatus{
+				WorkflowName: workflowName,
+				Status:       status,
+				Conclusion:   conclusion,
+				Duration:     duration,
+				UpdatedAt:    r.UpdatedAt.Format(time.RFC3339),
+			})
+		}
+	}
+	return statuses
+}
+
+// renderCIStatuses 将 CI 状态列表渲染为飞书 markdown
+func renderCIStatuses(statuses []CIStatus, repoURL string) string {
+	if len(statuses) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, cs := range statuses {
+		icon := "⏳"
+		statusText := cs.Status
+		switch cs.Conclusion {
+		case "success":
+			icon = "✅"
+			statusText = "passed"
+		case "failure":
+			icon = "❌"
+			statusText = "failed"
+		case "cancelled":
+			icon = "🚫"
+			statusText = "cancelled"
+		default:
+			if cs.Status == "in_progress" {
+				statusText = "running"
+			} else if cs.Status == "queued" || cs.Status == "waiting" {
+				icon = "⏳"
+				statusText = "pending"
+			}
+		}
+		durationPart := ""
+		if cs.Duration != "" {
+			durationPart = " (" + cs.Duration + ")"
+		}
+		runLink := ""
+		if repoURL != "" && cs.RunID > 0 {
+			runLink = fmt.Sprintf(" ([logs](%s/actions/runs/%d))", repoURL, cs.RunID)
+		}
+		lines = append(lines, fmt.Sprintf("%s %s **%s**%s%s", icon, cs.WorkflowName, statusText, durationPart, runLink))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ciFailed 检查 CI 状态列表中是否有失败的
+func ciFailed(statuses []CIStatus) bool {
+	for _, cs := range statuses {
+		if cs.Conclusion == "failure" || cs.Conclusion == "cancelled" {
+			return true
+		}
+	}
+	return false
+}
+
+// makeCIActionButtons 为失败的 CI 事件生成操作按钮
+func makeCIActionButtons(statuses []CIStatus, repoURL string) []ActionButton {
+	if repoURL == "" {
+		return nil
+	}
+	var btns []ActionButton
+	seenRuns := make(map[int64]bool)
+	for _, cs := range statuses {
+		if (cs.Conclusion == "failure" || cs.Conclusion == "cancelled") && cs.RunID > 0 && !seenRuns[cs.RunID] {
+			seenRuns[cs.RunID] = true
+			btns = append(btns, ActionButton{
+				Text: fmt.Sprintf("View %s Logs", cs.WorkflowName),
+				URL:  fmt.Sprintf("%s/actions/runs/%d", repoURL, cs.RunID),
+				Type: "danger",
+			})
+		}
+	}
+	if len(btns) > 1 {
+		btns = btns[:1]
+	}
+	if len(btns) > 0 {
+		btns = append(btns, ActionButton{
+			Text: "View All Workflows",
+			URL:  repoURL + "/actions",
+			Type: "default",
+		})
+	}
+	return btns
+}
+
 // BuildCard 构建符合飞书卡片 V2 规范的消息卡片
-func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl string, detail EventDetail) *Card {
+func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, detail EventDetail) *Card {
 	card := NewCard()
 	card.Header.Title = CardText{Tag: "plain_text", Content: detail.Title}
 	card.Header.Template = GetTemplate(detail.Title)
+	repoUrl := detail.RepoURL
 
 	// --- 1. 摘要信息行：仓库 / 分支 / 提交人（含头像） ---
 	repoPart := ""
@@ -913,8 +1089,12 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 			link = repoUrl
 		}
 		shaPart := ""
-		if detail.SHA != "" {
-			shaPart = fmt.Sprintf(" ([`%s`](%s/commit/%s))", detail.SHA, repoUrl, detail.SHA)
+		if detail.SHA != "" && repoUrl != "" {
+			sha := detail.FullSHA
+			if sha == "" {
+				sha = detail.SHA
+			}
+			shaPart = fmt.Sprintf(" ([`%s`](%s/commit/%s))", detail.SHA, repoUrl, sha)
 		}
 		if detail.IsTag {
 			refPart = fmt.Sprintf("🏷️ [%s](%s)%s", detail.RefName, link, shaPart)
@@ -1029,9 +1209,15 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 	// --- 2. 详情内容 ---
 	if detail.Text != "" {
 		card.AddDivider()
-		// 内容过长时截断摘要，完整内容放入折叠面板
-		const maxInlineRunes = 600
-		if len([]rune(detail.Text)) > maxInlineRunes {
+		// Push 事件：超过 3 条 commit 时折叠
+		if detail.Action == "push" && !detail.IsDeleted && detail.EventCount > 3 {
+			lines := strings.Split(detail.Text, "\n")
+			visible := strings.Join(lines[:3], "\n")
+			remaining := strings.Join(lines[3:], "\n")
+			card.AddMarkdown(visible)
+			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(lines)-3), remaining)
+		} else if len([]rune(detail.Text)) > 600 {
+			// 内容过长时截断摘要，完整内容放入折叠面板
 			summary := truncateAtLine(detail.Text, 300)
 			card.AddMarkdown(summary)
 			card.AddCollapsiblePanel("", detail.Text)
@@ -1040,25 +1226,35 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 		}
 	}
 
+	// --- 2.5 CI 状态（内联到触发事件的卡片）---
+	if ciText := renderCIStatuses(detail.CIStatuses, repoUrl); ciText != "" {
+		card.AddDivider()
+		card.AddMarkdown(ciText)
+	}
+
 	// --- 3. 可折叠的附加内容（PR body 中的 <details> 块等）---
 	if detail.FoldableBody != "" {
 		card.AddCollapsiblePanel("📝 展开查看详情", detail.FoldableBody)
 	}
 
 	// --- 4. 操作按钮（V2 规范：必须放在 action 容器内）---
+	// CI 失败时优先显示 CI 操作按钮
+	var btns []ActionButton
+	if ciFailed(detail.CIStatuses) {
+		btns = makeCIActionButtons(detail.CIStatuses, repoUrl)
+	}
 	// Push / 删除 / 新建分支等事件不显示详情按钮
 	skipBtn := strings.Contains(detail.Title, "commits") ||
 		strings.Contains(detail.Title, "Deleted") ||
 		strings.Contains(detail.Title, "Created")
 	if detail.URL != "" && !skipBtn {
 		btnType := "primary"
-		if ContainsAny(detail.Title, "❌", "💥") {
+		if ciFailed(detail.CIStatuses) || ContainsAny(detail.Title, "❌", "💥") {
 			btnType = "danger"
 		}
-
-		btns := []ActionButton{
-			{Text: "View Details", URL: detail.URL, Type: btnType},
-		}
+		btns = append(btns, ActionButton{Text: "View Details", URL: detail.URL, Type: btnType})
+	}
+	if len(btns) > 0 {
 		card.AddActions("flow", btns...)
 	}
 
@@ -1066,7 +1262,14 @@ func BuildCard(ctx context.Context, repo, repoUrl, sender, senderUrl, avatarUrl 
 	if detail.EventTime != "" {
 		if t, err := time.Parse(time.RFC3339, detail.EventTime); err == nil {
 			loc, _ := time.LoadLocation("Asia/Shanghai")
-			card.AddMarkdown(fmt.Sprintf("🕐 %s", t.In(loc).Format("2006-01-02 15:04:05")))
+			timeStr := t.In(loc).Format("2006-01-02 15:04:05")
+			// 合并事件显示时间范围
+			if detail.EventTimeEnd != "" {
+				if t2, err2 := time.Parse(time.RFC3339, detail.EventTimeEnd); err2 == nil {
+					timeStr += " ~ " + t2.In(loc).Format("15:04:05")
+				}
+			}
+			card.AddMarkdown(fmt.Sprintf("🕐 %s", timeStr))
 		}
 	}
 
@@ -1116,6 +1319,7 @@ func truncateAtLine(s string, maxRunes int) string {
 var conventionalRegex = regexp.MustCompile(`(?i)(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|ref)(\([^)]+\))?(!?):`)
 var shaRegex = regexp.MustCompile(`\b([0-9a-f]{7,40})\b`)
 var issueRegex = regexp.MustCompile(`(?i)(?:^|[\s,.\-=(])#(\d+)\b`)
+var prMergeRegex = regexp.MustCompile(`(?i)Merge pull request #(\d+)`)
 
 // Linkify 将文本中的 SHA 哈希和 #123 转换为 GitHub 链接
 func Linkify(text, repoUrl string) string {
