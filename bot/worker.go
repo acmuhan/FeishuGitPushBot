@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"strings"
@@ -735,6 +736,89 @@ func processWebhookEvent(event WebhookEvent) error {
 		status, _ := extractCIStatus(m, event.EventType)
 		if status == "in_progress" || status == "queued" || status == "waiting" {
 			slog.Info("CI event suppressed (no parent, in_progress)", "github_id", githubID, "status", status)
+			return nil
+		}
+	}
+
+	// 4.9 CI 事件合并：同一 commit 的多个 workflow 合并显示
+	if isCIEvent && parentMsgID == "" && sha != "" {
+		var existingCIRecord MessageRecord
+		if err := DB.NewSelect().Model(&existingCIRecord).
+			Where("event_type IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
+			Where("head_sha = ?", sha).
+			Where("repo_name = ?", repo).
+			Where("parent_msg_id = ''").
+			Order("id ASC").Limit(1).Scan(ctx); err == nil {
+			// 找到同一 commit 的 CI 消息，合并 CI 状态
+			var existingDetail EventDetail
+			_ = json.Unmarshal([]byte(existingCIRecord.Content), &existingDetail)
+
+			// 从 payload 提取 CI 信息
+			ciStatus, ciConclusion := extractCIStatus(m, event.EventType)
+			ciWorkflowName := detail.Title
+			ciRunID := int64(0)
+			ciDuration := ""
+			if event.EventType == "workflow_run" {
+				ciRunID, _ = strconv.ParseInt(ext(m, "workflow_run", "id"), 10, 64)
+				// 尝试从 workflow_run 对象中提取时间计算耗时
+				if wr, ok := m["workflow_run"].(map[string]any); ok {
+					if startedAtStr, ok := wr["run_started_at"].(string); ok {
+						if updatedAtStr, ok := wr["updated_at"].(string); ok {
+							if t1, err := time.Parse(time.RFC3339, startedAtStr); err == nil {
+								if t2, err := time.Parse(time.RFC3339, updatedAtStr); err == nil {
+									ciDuration = FormatDuration(t2.Sub(t1))
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// 检查是否已有同一 workflow 的状态，有则更新，无则追加
+			found := false
+			for i, cs := range existingDetail.CIStatuses {
+				if cs.RunID == ciRunID && ciRunID > 0 {
+					existingDetail.CIStatuses[i] = CIStatus{
+						WorkflowName: ciWorkflowName,
+						Status:       ciStatus,
+						Conclusion:   ciConclusion,
+						RunID:        ciRunID,
+						Ref:          ref,
+						Duration:     ciDuration,
+						UpdatedAt:    detail.EventTime,
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				existingDetail.CIStatuses = append(existingDetail.CIStatuses, CIStatus{
+					WorkflowName: ciWorkflowName,
+					Status:       ciStatus,
+					Conclusion:   ciConclusion,
+					RunID:        ciRunID,
+					Ref:          ref,
+					Duration:     ciDuration,
+					UpdatedAt:    detail.EventTime,
+				})
+			}
+
+			// 重建卡片
+			buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+			card := BuildCard(buildCtx, repo, existingCIRecord.Sender, existingCIRecord.SenderURL, existingCIRecord.AvatarURL2, existingDetail)
+			buildCancel()
+
+			if err := UpdateMessage(existingCIRecord.FeishuMessageID, card); err != nil {
+				slog.Error("Failed to update merged CI card", "error", err)
+			} else {
+				updatedJson, _ := json.Marshal(existingDetail)
+				_, _ = DB.NewUpdate().Model(&existingCIRecord).
+					Set("content = ?", string(updatedJson)).
+					Set("card_string = ?", card.String()).
+					Set("updated_at = ?", time.Now()).
+					WherePK().Exec(ctx)
+				slog.Info("CI event merged with existing", "github_id", githubID, "existing_id", existingCIRecord.GithubID)
+			}
 			return nil
 		}
 	}
