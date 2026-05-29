@@ -664,7 +664,8 @@ func processWebhookEvent(event WebhookEvent) error {
 				Where("event_type IN ('push', 'create')").
 				Where("head_sha = ?", sha).
 				Where("record_type != 'deleted'").
-				Order("CASE event_type WHEN 'create' THEN 0 ELSE 1 END, id ASC").
+				OrderExpr("CASE event_type WHEN 'create' THEN 0 ELSE 1 END").
+				Order("id ASC").
 				Limit(1).Scan(ctx); err == nil {
 				parentID = record.FeishuMessageID
 				parentMsgID = record.FeishuMessageID
@@ -932,6 +933,19 @@ func imageRefreshWorker() {
 	}
 }
 
+// isKnownUnavailableAvatar 检查是否是已知无法下载的头像 URL（如 GitHub bot 账号）
+func isKnownUnavailableAvatar(url string) bool {
+	unavailable := []string{
+		"github.com/Copilot.png",
+	}
+	for _, suffix := range unavailable {
+		if strings.HasSuffix(url, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func refreshOneImage(record MessageRecord) {
 	// 1. 解析保存的卡片详情，获取所有需要刷新的头像 URL
 	var detail EventDetail
@@ -949,6 +963,11 @@ func refreshOneImage(record MessageRecord) {
 	// 2. 依次上传所有头像，每个最多重试 10 次，指数退避
 	allUploaded := true
 	for _, avatarURL := range allAvatars {
+		// 跳过已知无法下载的头像（如 GitHub bot 账号）
+		if isKnownUnavailableAvatar(avatarURL) {
+			slog.Info("Image refresh: skipping known unavailable avatar", "url", avatarURL)
+			continue
+		}
 		uploaded := false
 		for attempt := 0; attempt < 10; attempt++ {
 			if attempt > 0 {

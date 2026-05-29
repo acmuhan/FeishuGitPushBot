@@ -108,7 +108,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 				}
 				if login != "" {
 					authors[login] = true
-					avatarMap[login] = fmt.Sprintf("https://github.com/%s.png", login)
+					avatarMap[login] = fmt.Sprintf("https://avatars.githubusercontent.com/%s", login)
 				}
 				// 检查 Co-authored-by
 				for _, coAuthor := range parseCoAuthors(c.GetMessage()) {
@@ -1710,7 +1710,7 @@ func parseCoAuthors(msg string) []AuthorInfo {
 			// 4. 统一使用 GitHub 提供的头像
 			avatar := ""
 			if login != "" {
-				avatar = fmt.Sprintf("https://github.com/%s.png", login)
+				avatar = fmt.Sprintf("https://avatars.githubusercontent.com/%s", login)
 			}
 
 			authors = append(authors, AuthorInfo{Name: name, Login: login, Avatar: avatar})
