@@ -514,6 +514,83 @@ func processWebhookEvent(event WebhookEvent) error {
 			}
 
 			// 兼容旧模式：独立 CI 消息
+			// workflow_job 事件：将 job 信息追加到 CIStatuses，而不是覆盖
+			if event.EventType == "workflow_job" {
+				var existingDetail EventDetail
+				_ = json.Unmarshal([]byte(record.Content), &existingDetail)
+
+				// 从 payload 提取 job 信息
+				jobName := ext(m, "workflow_job", "name")
+				jobStatus, jobConclusion := extractCIStatus(m, event.EventType)
+				jobRunID, _ := strconv.ParseInt(ext(m, "workflow_job", "run_id"), 10, 64)
+				jobDuration := ""
+				if jobConclusion != "" {
+					startedAtStr := ext(m, "workflow_job", "started_at")
+					completedAtStr := ext(m, "workflow_job", "completed_at")
+					if startedAtStr != "" && completedAtStr != "" {
+						if t1, err := time.Parse(time.RFC3339, startedAtStr); err == nil {
+							if t2, err := time.Parse(time.RFC3339, completedAtStr); err == nil {
+								jobDuration = FormatDuration(t2.Sub(t1))
+							}
+						}
+					}
+				}
+
+				// 查找并更新或追加 job 状态
+				jobKey := "job:" + ext(m, "workflow_job", "id")
+				found := false
+				for i, cs := range existingDetail.CIStatuses {
+					if cs.WorkflowName == jobKey {
+						existingDetail.CIStatuses[i] = CIStatus{
+							WorkflowName: jobKey,
+							JobName:      jobName,
+							Status:       jobStatus,
+							Conclusion:   jobConclusion,
+							RunID:        jobRunID,
+							ParentRunID:  jobRunID,
+							Ref:          ref,
+							Duration:     jobDuration,
+							UpdatedAt:    detail.EventTime,
+						}
+						found = true
+						break
+					}
+				}
+				if !found {
+					existingDetail.CIStatuses = append(existingDetail.CIStatuses, CIStatus{
+						WorkflowName: jobKey,
+						JobName:      jobName,
+						Status:       jobStatus,
+						Conclusion:   jobConclusion,
+						RunID:        jobRunID,
+						ParentRunID:  jobRunID,
+						Ref:          ref,
+						Duration:     jobDuration,
+						UpdatedAt:    detail.EventTime,
+					})
+				}
+
+				// 重建卡片
+				buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+				card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, existingDetail)
+				buildCancel()
+
+				if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
+					return fmt.Errorf("failed to update message: %w", err)
+				}
+
+				updatedJson, _ := json.Marshal(existingDetail)
+				_, _ = DB.NewUpdate().Model(&record).
+					Set("content = ?", string(updatedJson)).
+					Set("card_string = ?", card.String()).
+					Set("updated_at = ?", time.Now()).
+					WherePK().Exec(ctx)
+
+				slog.Info("Workflow job appended", "github_id", githubID, "job", jobName)
+				return nil
+			}
+
+			// workflow_run 等其他 CI 事件：直接更新
 			buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
 			card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
 			buildCancel()

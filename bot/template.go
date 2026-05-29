@@ -50,6 +50,9 @@ type CIStatus struct {
 	Ref          string `json:"ref"`           // 分支名
 	Duration     string `json:"duration"`      // 格式化后的耗时
 	UpdatedAt    string `json:"updated_at"`    // 最后更新时间 (RFC3339)
+	// Job 专用字段
+	JobName    string `json:"job_name,omitempty"`    // job 名称（用于显示）
+	ParentRunID int64  `json:"parent_run_id,omitempty"` // 关联的 workflow run ID
 }
 
 // ParseEvent 解析 GitHub 事件为极简明了的 Detail
@@ -1024,39 +1027,91 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 	if len(statuses) == 0 {
 		return ""
 	}
-	var lines []string
+
+	// 分离 workflow 和 job 条目
+	type workflowGroup struct {
+		workflow CIStatus
+		jobs     []CIStatus
+	}
+	var groups []workflowGroup
+	workflowMap := make(map[string]*workflowGroup)
+
 	for _, cs := range statuses {
-		icon := "⏳"
-		statusText := cs.Status
-		switch cs.Conclusion {
-		case "success":
-			icon = "✅"
-			statusText = "passed"
-		case "failure":
-			icon = "❌"
-			statusText = "failed"
-		case "cancelled":
-			icon = "🚫"
-			statusText = "cancelled"
-		default:
-			if cs.Status == "in_progress" {
-				statusText = "running"
-			} else if cs.Status == "queued" || cs.Status == "waiting" {
-				icon = "⏳"
-				statusText = "pending"
+		if strings.HasPrefix(cs.WorkflowName, "job:") {
+			// job 条目：提取 parent_run_id 关联到 workflow
+			if cs.ParentRunID > 0 {
+				key := fmt.Sprintf("%d", cs.ParentRunID)
+				if g, ok := workflowMap[key]; ok {
+					g.jobs = append(g.jobs, cs)
+				}
 			}
+		} else {
+			// workflow 条目
+			key := fmt.Sprintf("%d", cs.RunID)
+			g := workflowGroup{workflow: cs}
+			workflowMap[key] = &g
+			groups = append(groups, g)
 		}
-		durationPart := ""
-		if cs.Duration != "" {
-			durationPart = " (" + cs.Duration + ")"
+	}
+	// 更新 groups 中的 jobs
+	for i := range groups {
+		key := fmt.Sprintf("%d", groups[i].workflow.RunID)
+		if g, ok := workflowMap[key]; ok {
+			groups[i].jobs = g.jobs
 		}
-		runLink := ""
-		if repoURL != "" && cs.RunID > 0 {
-			runLink = fmt.Sprintf(" ([logs](%s/actions/runs/%d))", repoURL, cs.RunID)
+	}
+
+	var lines []string
+	for _, g := range groups {
+		lines = append(lines, renderSingleCIStatus(g.workflow, repoURL, false))
+		for _, job := range g.jobs {
+			lines = append(lines, renderSingleCIStatus(job, repoURL, true))
 		}
-		lines = append(lines, fmt.Sprintf("%s %s **%s**%s%s", icon, cs.WorkflowName, statusText, durationPart, runLink))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// renderSingleCIStatus 渲染单条 CI 状态
+func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
+	icon := "⏳"
+	statusText := cs.Status
+	switch cs.Conclusion {
+	case "success":
+		icon = "✅"
+		statusText = "passed"
+	case "failure":
+		icon = "❌"
+		statusText = "failed"
+	case "cancelled":
+		icon = "🚫"
+		statusText = "cancelled"
+	default:
+		if cs.Status == "in_progress" {
+			statusText = "running"
+		} else if cs.Status == "queued" || cs.Status == "waiting" {
+			icon = "⏳"
+			statusText = "pending"
+		}
+	}
+	durationPart := ""
+	if cs.Duration != "" {
+		durationPart = " (" + cs.Duration + ")"
+	}
+	runLink := ""
+	if repoURL != "" && cs.RunID > 0 && !isJob {
+		runLink = fmt.Sprintf(" ([logs](%s/actions/runs/%d))", repoURL, cs.RunID)
+	}
+
+	// 提取显示名称
+	displayName := cs.WorkflowName
+	if strings.HasPrefix(displayName, "job:") {
+		displayName = cs.JobName // 使用存储的 job 名称
+	}
+
+	if isJob {
+		return fmt.Sprintf("    %s %s **%s**%s", icon, displayName, statusText, durationPart)
+	}
+	return fmt.Sprintf("%s %s **%s**%s%s", icon, displayName, statusText, durationPart, runLink)
 }
 
 // ciFailed 检查 CI 状态列表中是否有失败的
