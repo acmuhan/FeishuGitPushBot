@@ -388,6 +388,12 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	// 2.1 提取 SHA (用于后续寻找父消息或更新原本的推送)
 	sha := ext(m, "head_commit", "id")
+	// push 事件：head_commit 可能缺失（如 force push、payload 裁剪），回退到 after 字段
+	if sha == "" && event.EventType == "push" {
+		if after := ext(m, "after"); after != "" && !strings.HasPrefix(after, "0000000000") {
+			sha = after
+		}
+	}
 	if sha == "" {
 		sha = ext(m, "pull_request", "head", "sha")
 	}
