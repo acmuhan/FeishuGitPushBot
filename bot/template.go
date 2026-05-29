@@ -903,6 +903,9 @@ func GetTemplate(title string) string {
 	if ContainsAny(title, "⏳", "🏃", "running", "Started", "Running") {
 		return string(cardColorOrange)
 	}
+	if ContainsAny(title, "🗑️", "Deleted") {
+		return string(cardColorGrey)
+	}
 	if ContainsAny(title, "🏷️", "Tag", "New Tag") {
 		return string(cardColorPurple)
 	}
@@ -914,9 +917,6 @@ func GetTemplate(title string) string {
 	}
 	if ContainsAny(title, "🥕", "PullRequest", "PR") {
 		return "indigo"
-	}
-	if ContainsAny(title, "🗑️", "Deleted") {
-		return string(cardColorGrey)
 	}
 	return string(cardColorBlue)
 }
@@ -1109,6 +1109,11 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		repoUrl = fmt.Sprintf("https://github.com/%s", repo)
 	}
 
+	// 删除事件：标题改为仓库名，避免冗余
+	if detail.IsDeleted && repo != "" {
+		card.Header.Title = CardText{Tag: "plain_text", Content: fmt.Sprintf("%s: %s", strings.SplitN(detail.Title, ":", 2)[0], repo)}
+	}
+
 	// --- 1. 摘要信息行：仓库 / 分支 / 提交人（含头像） ---
 	repoPart := ""
 	if repo != "" {
@@ -1174,6 +1179,65 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 			resolvedAvatars = append(resolvedAvatars, key)
 		}
 	}
+
+	// 删除事件：简洁单行 body，不显示冗余仓库/分支摘要
+	if detail.IsDeleted {
+		tagIcon := "🗑️🌿"
+		if detail.IsTag {
+			tagIcon = "🗑️🏷️"
+		}
+		refLink := ""
+		if detail.RefName != "" && detail.RefURL != "" {
+			refLink = fmt.Sprintf(" [%s](%s)", detail.RefName, detail.RefURL)
+		} else if detail.RefName != "" {
+			refLink = fmt.Sprintf(" `%s`", detail.RefName)
+		}
+		senderText := fmt.Sprintf("[%s](%s)", sender, senderUrl)
+		if len(detail.AuthorLogins) == 1 {
+			login := detail.AuthorLogins[0]
+			senderText = fmt.Sprintf("[%s](https://github.com/%s)", login, login)
+		}
+		content := fmt.Sprintf("%s%s 👤 %s", tagIcon, refLink, senderText)
+		if len(resolvedAvatars) > 0 {
+			avatarEls := make([]any, 0, len(resolvedAvatars))
+			for _, key := range resolvedAvatars {
+				avatarEls = append(avatarEls, map[string]any{
+					"tag":          "img",
+					"img_key":      key,
+					"custom_width": 20,
+					"mode":         "crop_center",
+					"alt":          map[string]string{"tag": "plain_text", "content": "avatar"},
+				})
+			}
+			card.Body.Elements = append(card.Body.Elements, map[string]any{
+				"tag":                "column_set",
+				"flex_mode":          "none",
+				"horizontal_spacing": "small",
+				"columns": []any{
+					map[string]any{
+						"tag": "column", "width": "weighted", "weight": 1,
+						"vertical_align": "center",
+						"elements":       []any{map[string]any{"tag": "markdown", "content": content}},
+					},
+					map[string]any{
+						"tag": "column", "width": "auto",
+						"vertical_align": "center",
+						"elements":       avatarEls,
+					},
+				},
+			})
+		} else {
+			card.AddMarkdown(content)
+		}
+		// 删除事件也加 View Details 按钮
+		btnURL := repoUrl
+		if detail.URL != "" {
+			btnURL = detail.URL
+		}
+		if btnURL != "" {
+			card.AddActions("flow", ActionButton{Text: "View Details", URL: btnURL, Type: "default"})
+		}
+	} else {
 
 	// 构建摘要行：用 column_set 排列 [meta文本] [头像...] [发送者]
 	// 头像全部合并进一个列（inline 排列），避免列数过多
@@ -1290,6 +1354,7 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	if len(btns) > 0 {
 		card.AddActions("flow", btns...)
 	}
+	} // end of non-delete rendering
 
 	// --- 5. 事件发生时间 ---
 	if detail.EventTime != "" {
