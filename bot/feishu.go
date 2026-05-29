@@ -334,7 +334,6 @@ func (c *Card) AddCollapsiblePanel(title, content string) {
 				"tag":     "lark_md",
 				"content": title,
 			},
-			"padding": "4px 0px",
 		},
 		"elements": []any{
 			map[string]any{
