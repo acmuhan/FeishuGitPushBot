@@ -759,12 +759,20 @@ func ParseEvent(event any, eventType string) EventDetail {
 			}
 		}
 		d.Title = fmt.Sprintf("🏢 Org %s: %s", org.GetLogin(), e.GetAction())
-		d.Text = fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), login)
+		text := fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), login)
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != login {
+			text += fmt.Sprintf("\nBy: **%s**", sender.GetLogin())
+		}
+		d.Text = text
 		d.Action = e.GetAction()
 		d.URL = org.GetHTMLURL()
 		if login != "" && login != "****" {
 			d.AuthorLogins = []string{login}
 			d.AuthorAvatars = []string{member.GetAvatarURL()}
+		}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != login {
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
 		}
 		if ts := org.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Format(time.RFC3339)
@@ -791,11 +799,19 @@ func ParseEvent(event any, eventType string) EventDetail {
 			return d
 		}
 		d.Title = fmt.Sprintf("👤 Member %s: %s", member.GetLogin(), e.GetAction())
-		d.Text = fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), member.GetLogin())
+		text := fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), member.GetLogin())
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			text += fmt.Sprintf("\nBy: **%s**", sender.GetLogin())
+		}
+		d.Text = text
 		d.Action = e.GetAction()
 		d.URL = member.GetHTMLURL()
 		d.AuthorLogins = []string{member.GetLogin()}
 		d.AuthorAvatars = []string{member.GetAvatarURL()}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
+		}
 		if ts := member.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Format(time.RFC3339)
 		}
@@ -862,10 +878,18 @@ func ParseEvent(event any, eventType string) EventDetail {
 			return d
 		}
 		d.Title = fmt.Sprintf("👥 Membership %s: %s", member.GetLogin(), e.GetAction())
-		d.Text = fmt.Sprintf("Action: **%s**\nMember: **%s**\nScope: **%s**", e.GetAction(), member.GetLogin(), e.GetScope())
+		text := fmt.Sprintf("Action: **%s**\nMember: **%s**\nScope: **%s**", e.GetAction(), member.GetLogin(), e.GetScope())
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			text += fmt.Sprintf("\nBy: **%s**", sender.GetLogin())
+		}
+		d.Text = text
 		d.Action = e.GetAction()
 		d.AuthorLogins = []string{member.GetLogin()}
 		d.AuthorAvatars = []string{member.GetAvatarURL()}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
+		}
 	}
 	return d
 }
