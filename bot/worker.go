@@ -82,6 +82,11 @@ func getMergeWindow() time.Duration {
 	return time.Duration(C.Events.MergeWindow) * time.Minute
 }
 
+// getThreadReplyWindow 返回配置的话题回复窗口时长
+func getThreadReplyWindow() time.Duration {
+	return time.Duration(C.Events.ThreadReplyWindow) * time.Minute
+}
+
 // mergeSearch 定义查找已有消息记录的搜索条件
 // githubID 和 githubIDLike 为 OR 关系，eventType / withinWindow / recordType 为 AND 关系
 type mergeSearch struct {
@@ -430,8 +435,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	case "workflow_run":
 		githubID = "wf:" + ext(m, "workflow_run", "id")
 	case "workflow_job":
-		// 统一使用 Run ID 追踪，确保 Job 的进度能更新 Run 的消息
-		githubID = "wf:" + ext(m, "workflow_job", "run_id")
+		// 每个 Job 使用独立 ID 追踪，避免覆盖 workflow_run 或其他 job 的记录
+		githubID = "wfjob:" + ext(m, "workflow_job", "id")
 	case "check_run":
 		// 使用 check_suite.id 进行统一追踪
 		githubID = "wf:" + ext(m, "check_run", "check_suite", "id")
@@ -456,6 +461,12 @@ func processWebhookEvent(event WebhookEvent) error {
 		githubID = fmt.Sprintf("pr:%s:%s", repo, ext(m, "pull_request", "number"))
 	case "issues":
 		githubID = fmt.Sprintf("issue:%s:%s", repo, ext(m, "issue", "number"))
+	case "issue_comment":
+		githubID = fmt.Sprintf("comment:%s:%s", repo, ext(m, "issue", "number"))
+	case "pull_request_review_comment":
+		githubID = fmt.Sprintf("prcomment:%s:%s", repo, ext(m, "pull_request", "number"))
+	case "pull_request_review":
+		githubID = fmt.Sprintf("prreview:%s:%s", repo, ext(m, "pull_request", "number"))
 	default:
 		githubID = sha
 		if githubID == "" {
@@ -753,6 +764,56 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
+	// 4.5a 评论合并：同一 Issue/PR 在合并窗口内的评论合并为一条
+	if event.EventType == "issue_comment" && ext(m, "action") == "created" && githubID != "" {
+		issueNum := ext(m, "issue", "number")
+		merged, err := tryMergeWithExisting(ctx,
+			mergeSearch{githubID: githubID, withinWindow: true},
+			func(old, new *EventDetail) {
+				if old.Text != "" {
+					new.Text = old.Text + "\n---\n" + new.Text
+				}
+				new.Title = fmt.Sprintf("🌻 Comments on #%s", issueNum)
+				new.Action = "created"
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime
+				}
+				new.EventTimeEnd = currentTime
+				new.EventCount = old.EventCount + 1
+			},
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"Comments merged",
+		)
+		if merged {
+			return err
+		}
+	}
+	if event.EventType == "pull_request_review_comment" && ext(m, "action") == "created" && githubID != "" {
+		prNum := ext(m, "pull_request", "number")
+		merged, err := tryMergeWithExisting(ctx,
+			mergeSearch{githubID: githubID, withinWindow: true},
+			func(old, new *EventDetail) {
+				if old.Text != "" {
+					new.Text = old.Text + "\n---\n" + new.Text
+				}
+				new.Title = fmt.Sprintf("💬 PR Comments on #%s", prNum)
+				new.Action = "created"
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime
+				}
+				new.EventTimeEnd = currentTime
+				new.EventCount = old.EventCount + 1
+			},
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"PR comments merged",
+		)
+		if merged {
+			return err
+		}
+	}
+
 	// 4.6 Tag/Workflow 关联最近的 commit，以话题形式回复
 	var parentID string
 	if event.EventType == "create" && detail.IsTag {
@@ -795,7 +856,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			if err := DB.NewSelect().Model(&pendingPush).
 				Where("event_type = ?", "push").
 				Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
-				Where("payload LIKE ?", "%"+sha+"%").
+				Where("head_sha = ?", sha).
 				Limit(1).Scan(ctx); err == nil {
 				// 改回 pending 重新排队，不增加 retry_count，避免耗尽重试次数
 				slog.Info("Rescheduling CI event, waiting for push", "sha", sha, "event_type", event.EventType, "reschedule", event.RescheduleCount+1)
@@ -951,6 +1012,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	// 5. 查找父级 ID (回复逻辑)
 	// 改为：只要是 Issue/PR 相关的非"创建"事件，都尝试寻找父消息进行话题回复
 	// 注意：CI 事件不在这里处理，它们的父消息已在 4.6 通过 head_sha 精确关联
+	// 注意：评论合并（4.5a）在本步骤之前执行，已合并的评论不会进入本逻辑
 	isInteraction := event.EventType == "issue_comment" ||
 		event.EventType == "pull_request_review_comment" ||
 		event.EventType == "pull_request_review" ||
@@ -959,9 +1021,17 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	action := ext(m, "action")
 	if isInteraction && action != "opened" {
+		// 通过 SHA 查找父消息，限制在话题回复窗口内
 		if parentID == "" && sha != "" {
-			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
-				parentID = rec.FeishuMessageID
+			var shaRecord MessageRecord
+			if err := DB.NewSelect().Model(&shaRecord).
+				Where("repo_name = ?", repo).
+				Where("event_type IN ('push', 'create')").
+				Where("head_sha = ?", sha).
+				Where("record_type != 'deleted'").
+				Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
+				Order("id ASC").Limit(1).Scan(ctx); err == nil {
+				parentID = shaRecord.FeishuMessageID
 			}
 		}
 		if parentID == "" {
@@ -973,13 +1043,16 @@ func processWebhookEvent(event WebhookEvent) error {
 				var record MessageRecord
 				searchID := fmt.Sprintf("%%:%s", issueNum)
 				if strings.Contains(githubID, "pr:") || strings.Contains(githubID, "issue:") {
-					// 如果我们已经有了带 repo 的 ID 前缀，直接搜索完整匹配或相似匹配
+					searchID = fmt.Sprintf("%%:%s:%s", repo, issueNum)
+				}
+				if strings.Contains(githubID, "comment:") || strings.Contains(githubID, "prcomment:") || strings.Contains(githubID, "prreview:") {
 					searchID = fmt.Sprintf("%%:%s:%s", repo, issueNum)
 				}
 
 				if err := DB.NewSelect().Model(&record).
 					Where("github_id = ? OR github_id LIKE ?", fmt.Sprintf("pr:%s:%s", repo, issueNum), searchID).
 					WhereOr("github_id = ?", fmt.Sprintf("issue:%s:%s", repo, issueNum)).
+					Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
 					Order("id ASC").Limit(1).Scan(ctx); err == nil {
 					parentID = record.FeishuMessageID
 				}

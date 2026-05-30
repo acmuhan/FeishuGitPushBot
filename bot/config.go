@@ -25,7 +25,8 @@ type Config struct {
 		URL string `koanf:"url"`
 	} `koanf:"database"`
 	Events struct {
-		MergeWindow int `koanf:"merge_window"` // 同类事件合并窗口（分钟），默认 10
+		MergeWindow       int `koanf:"merge_window"`        // 同类事件合并窗口（分钟），默认 10
+		ThreadReplyWindow int `koanf:"thread_reply_window"` // 话题回复窗口（分钟），超过此时间的父消息不再以话题回复，默认 60
 	} `koanf:"events"`
 	Security struct {
 		AllowedIPs string `koanf:"allowed_ips"` // GitHub Webhook 来源 IP 白名单（CIDR，逗号分隔），留空则不校验
@@ -61,6 +62,9 @@ func LoadConfig() {
 		if s == "events_merge_window" {
 			return "events.merge_window"
 		}
+		if s == "events_thread_reply_window" {
+			return "events.thread_reply_window"
+		}
 		if s == "github_webhook_ips" {
 			return "security.allowed_ips"
 		}
@@ -88,7 +92,11 @@ func LoadConfig() {
 	if C.Events.MergeWindow == 0 {
 		C.Events.MergeWindow = 10 // 默认 10 分钟
 	}
+	if C.Events.ThreadReplyWindow == 0 {
+		C.Events.ThreadReplyWindow = 60 // 默认 60 分钟
+	}
 	slog.Info("Event merge window", "minutes", C.Events.MergeWindow)
+	slog.Info("Thread reply window", "minutes", C.Events.ThreadReplyWindow)
 	if C.Security.AllowedIPs != "" {
 		slog.Info("Webhook IP whitelist enabled", "ips", C.Security.AllowedIPs)
 	}

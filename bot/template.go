@@ -1016,7 +1016,7 @@ func parseRunIDFromURL(url string) int64 {
 }
 
 // getCIStatusesForParent 查询关联到指定父消息的所有 CI 事件状态
-// 从每条 CI 记录的 EventDetail 构造 CIStatus（CI 记录不单独存储 CIStatuses）
+// 优先从 EventDetail.CIStatuses 读取结构化数据，回退到标题解析（兼容旧记录）
 func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus {
 	if DB == nil || parentMsgID == "" {
 		return nil
@@ -1034,8 +1034,26 @@ func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus 
 	for _, r := range records {
 		var detail EventDetail
 		_ = json.Unmarshal([]byte(r.Content), &detail)
-		// 从 EventDetail 的 Title 提取 CI 状态信息
-		// Title 格式: "✅ Workflow Succeeded: CI" / "❌ Workflow Failed: CI" / "✅ Check: lint"
+
+		// 优先使用结构化的 CIStatuses 字段
+		if len(detail.CIStatuses) > 0 {
+			for _, cs := range detail.CIStatuses {
+				key := cs.WorkflowName
+				if cs.JobName != "" {
+					key = cs.JobName
+				}
+				if !seen[key] {
+					seen[key] = true
+					if cs.UpdatedAt == "" {
+						cs.UpdatedAt = r.UpdatedAt.Format(time.RFC3339)
+					}
+					statuses = append(statuses, cs)
+				}
+			}
+			continue
+		}
+
+		// 回退：从 Title 解析（兼容旧记录）
 		workflowName := ""
 		titleParts := strings.SplitN(detail.Title, ": ", 2)
 		if len(titleParts) > 1 {
@@ -1057,7 +1075,6 @@ func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus 
 		key := workflowName
 		if !seen[key] {
 			seen[key] = true
-			// 从 Text 中提取耗时信息
 			duration := ""
 			if idx := strings.Index(detail.Text, " in "); idx >= 0 {
 				duration = strings.TrimSpace(detail.Text[idx+4:])

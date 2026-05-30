@@ -71,12 +71,22 @@ func GithubHandler(c *gin.Context) {
 			fmt.Sscanf(hookID, "%d", &hookIDInt)
 		}
 
+		// 提取 head SHA 用于 CI 重调度快速查找
+		headSHA := ""
+		var payloadMap map[string]any
+		_ = json.Unmarshal(payload, &payloadMap)
+		headSHA = ext(payloadMap, "head_commit", "id")
+		if headSHA == "" {
+			headSHA = ext(payloadMap, "after")
+		}
+
 		_, err := DB.NewInsert().Model(&WebhookEvent{
 			DeliveryID: deliveryID,
 			EventType:  eventType,
 			HookID:     hookIDInt,
 			Payload:    string(payload),
 			Status:     "pending",
+			HeadSHA:    headSHA,
 		}).Exec(c.Request.Context())
 		if err != nil {
 			slog.Error("Failed to record Webhook event",

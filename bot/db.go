@@ -69,6 +69,7 @@ type WebhookEvent struct {
 	Status         string    `bun:",default:'pending'"` // pending, processed, failed
 	RetryCount     int       `bun:",default:0"`
 	RescheduleCount int      `bun:",default:0"` // CI 事件等待 push 事件的重调度次数
+	HeadSHA         string   `bun:""`           // 从 payload 中提取的 head SHA，用于快速 CI 重调度查找
 	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
@@ -144,6 +145,7 @@ func migrateDB(db *bun.DB) {
 		// WebhookEvent
 		{"webhook_events", "hook_id", "BIGINT"},
 		{"webhook_events", "reschedule_count", "INT DEFAULT 0"},
+		{"webhook_events", "head_sha", "TEXT"},
 		// ImageCache
 		{"image_caches", "hash", "TEXT"},
 	}
