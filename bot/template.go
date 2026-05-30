@@ -698,15 +698,18 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 
 	case *github.DeleteEvent:
+		ref := e.GetRef()
 		if e.GetRefType() == "tag" {
-			ref := e.GetRef()
 			d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", ref)
 			d.RefName = ref
 			d.IsTag = true
 			d.IsDeleted = true
 			d.Text = fmt.Sprintf("🗑️ %s", ref)
 		} else {
-			d.Skip = true
+			d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", ref)
+			d.RefName = ref
+			d.IsDeleted = true
+			d.Text = fmt.Sprintf("🗑️ %s", ref)
 		}
 
 	case *github.PublicEvent:
