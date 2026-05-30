@@ -375,7 +375,7 @@ func (c *Card) AddActions(layout string, buttons ...ActionButton) {
 		flexMode = "trisect"
 	}
 
-	c.AddColumnSet(flexMode, "default", columns...)
+	c.AddColumnSet(flexMode, "small", columns...)
 }
 
 // ToMap 将 ActionButton 转换为 V2 规范的 button 组件 map

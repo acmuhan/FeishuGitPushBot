@@ -3,8 +3,7 @@ package bot
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -87,7 +86,7 @@ type ImageCache struct {
 // InitDB 初始化数据库连接并执行自动迁移
 func InitDB() {
 	if C.Database.URL == "" {
-		log.Println("Skipping database initialization: DATABASE_URL not set")
+		slog.Warn("Skipping database initialization: DATABASE_URL not set")
 		return
 	}
 
@@ -98,24 +97,24 @@ func InitDB() {
 	ctx := context.Background()
 	_, err := db.NewCreateTable().Model((*MessageRecord)(nil)).IfNotExists().Exec(ctx)
 	if err != nil {
-		log.Printf("Database migration failed (skipping database features): %v", err)
+		slog.Error("Database migration failed (skipping database features)", "error", err)
 		return
 	}
 
 	_, err = db.NewCreateTable().Model((*ImageCache)(nil)).IfNotExists().Exec(ctx)
 	if err != nil {
-		log.Printf("Image cache migration failed (skipping image cache): %v", err)
+		slog.Error("Image cache migration failed (skipping image cache)", "error", err)
 		return
 	}
 
 	_, err = db.NewCreateTable().Model((*WebhookEvent)(nil)).IfNotExists().Exec(ctx)
 	if err != nil {
-		log.Printf("Webhook event table migration failed: %v", err)
+		slog.Error("Webhook event table migration failed", "error", err)
 		return
 	}
 
 	DB = db
-	log.Println("Database initialization successful")
+	slog.Info("Database initialization successful")
 
 	// 自动补齐缺失的列（ALTER TABLE ADD COLUMN IF NOT EXISTS）
 	migrateDB(db)
@@ -150,12 +149,9 @@ func migrateDB(db *bun.DB) {
 	}
 
 	for _, m := range migrations {
-		_, err := db.Exec(fmt.Sprintf(
-			"ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
-			m.table, m.column, m.typ,
-		))
+		_, err := db.Exec("ALTER TABLE ? ADD COLUMN IF NOT EXISTS ? ?", bun.Ident(m.table), bun.Ident(m.column), bun.Safe(m.typ))
 		if err != nil {
-			log.Printf("Migration warning: %s.%s — %v", m.table, m.column, err)
+			slog.Warn("Migration warning", "table", m.table, "column", m.column, "error", err)
 		}
 	}
 }

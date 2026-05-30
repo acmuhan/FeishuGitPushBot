@@ -1466,7 +1466,10 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	// --- 5. 事件发生时间 ---
 	if detail.EventTime != "" {
 		if t, err := time.Parse(time.RFC3339, detail.EventTime); err == nil {
-			loc, _ := time.LoadLocation("Asia/Shanghai")
+			loc, err := time.LoadLocation("Asia/Shanghai")
+			if err != nil {
+				loc = time.UTC
+			}
 			timeStr := t.In(loc).Format("2006-01-02 15:04:05")
 			// 合并事件显示时间范围
 			if detail.EventTimeEnd != "" {
@@ -1506,19 +1509,6 @@ func SafeText(s string, maxRunes int) string {
 		return string(runes[:maxRunes]) + "..."
 	}
 	return s
-}
-
-// truncateAtLine 在行边界处截断文本，保留不超过 maxRunes 个字符的完整行
-func truncateAtLine(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
-	}
-	truncated := string(runes[:maxRunes])
-	if idx := strings.LastIndex(truncated, "\n"); idx > 0 {
-		truncated = truncated[:idx]
-	}
-	return truncated + "\n..."
 }
 
 var conventionalRegex = regexp.MustCompile(`(?i)(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|ref)(\([^)]+\))?(!?):`)
@@ -1665,10 +1655,10 @@ func htmlToMarkdown(s string) string {
 	s = convertBlockTags(s)
 
 	// Step 4: 移除残留的 HTML 标签
-	s = regexp.MustCompile(`(?s)<[^>]*>`).ReplaceAllString(s, "")
+	s = reStripHTML.ReplaceAllString(s, "")
 
 	// Step 5: 清理多余空白
-	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+	s = reMultiNewline.ReplaceAllString(s, "\n\n")
 	s = strings.TrimSpace(s)
 
 	return s
@@ -1692,6 +1682,9 @@ var (
 	reLi         = regexp.MustCompile(`(?is)<li\s*>(.*?)</li>`)
 	reBq         = regexp.MustCompile(`(?is)<blockquote\s*>(.*?)</blockquote>`)
 	reHr         = regexp.MustCompile(`(?is)<hr\s*/?>`)
+	reStripHTML    = regexp.MustCompile(`(?s)<[^>]*>`)
+	reMultiNewline = regexp.MustCompile(`\n{3,}`)
+	reDetails      = regexp.MustCompile(`(?is)<details.*?>\s*<summary.*?>(.*?)</summary>(.*?)</details>`)
 )
 
 func convertInlineTags(s string) string {
@@ -1783,18 +1776,17 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 	s = strings.ReplaceAll(s, "```mermaid", "```")
 
 	// 2. 提取 <details> <summary> 折叠内容
-	reDetails := regexp.MustCompile(`(?is)<details.*?>\s*<summary.*?>(.*?)</summary>(.*?)</details>`)
 	var foldables []string
 
 	processed := reDetails.ReplaceAllStringFunc(s, func(m string) string {
 		match := reDetails.FindStringSubmatch(m)
 		if len(match) > 2 {
 			title := strings.TrimSpace(match[1])
-			title = regexp.MustCompile(`(?s)<[^>]*>`).ReplaceAllString(title, "")
+			title = reStripHTML.ReplaceAllString(title, "")
 
 			content := strings.TrimSpace(match[2])
 			content = htmlToMarkdown(content)
-			content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
+			content = reMultiNewline.ReplaceAllString(content, "\n\n")
 
 			foldables = append(foldables, fmt.Sprintf("**%s**\n%s", title, strings.TrimSpace(content)))
 		}
@@ -1813,9 +1805,9 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 }
 
 // GetDiffOnlyAdded 生成仅包含新增内容的 Diff
-func GetDiffOnlyAdded(old, new string) string {
+func GetDiffOnlyAdded(old, newStr string) string {
 	if old == "" {
-		return new
+		return newStr
 	}
 
 	oldLines := strings.Split(old, "\n")
@@ -1824,7 +1816,7 @@ func GetDiffOnlyAdded(old, new string) string {
 		oldMap[l] = true
 	}
 
-	newLines := strings.Split(new, "\n")
+	newLines := strings.Split(newStr, "\n")
 	var diff []string
 	for _, l := range newLines {
 		if !oldMap[l] {

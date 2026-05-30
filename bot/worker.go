@@ -442,13 +442,13 @@ func processWebhookEvent(event WebhookEvent) error {
 	case "create":
 		// 创建事件：区分 tag 和 branch
 		refType := ext(m, "ref_type")
-		ref := ext(m, "ref")
-		githubID = fmt.Sprintf("create:%s:%s:%s", repo, refType, ref)
+		eventRef := ext(m, "ref")
+		githubID = fmt.Sprintf("create:%s:%s:%s", repo, refType, eventRef)
 	case "delete":
 		// 删除事件：区分 tag 和 branch
 		refType := ext(m, "ref_type")
-		ref := ext(m, "ref")
-		githubID = fmt.Sprintf("delete:%s:%s:%s", repo, refType, ref)
+		eventRef := ext(m, "ref")
+		githubID = fmt.Sprintf("delete:%s:%s:%s", repo, refType, eventRef)
 	case "release":
 		// release 事件按 tag 区分，支持更新
 		githubID = fmt.Sprintf("release:%s:%s", repo, ext(m, "release", "tag_name"))
@@ -811,12 +811,28 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	// 4.7 CI 事件内联到父消息：保存 CI 记录并更新父消息卡片
 	if isCIEvent && parentMsgID != "" {
-		detailJson, _ := json.Marshal(detail)
 		workflowStartedAt := time.Time{}
 		status, conclusion := extractCIStatus(m, event.EventType)
 		if status == "in_progress" && conclusion == "" {
 			workflowStartedAt = time.Now()
 		}
+		// 构建初始 CIStatus 供 getCIStatusesForParent 直接读取
+		ciStatus := CIStatus{
+			WorkflowName: detail.Title,
+			Status:       status,
+			Conclusion:   conclusion,
+			UpdatedAt:    detail.EventTime,
+		}
+		if event.EventType == "workflow_run" {
+			ciStatus.RunID, _ = strconv.ParseInt(ext(m, "workflow_run", "id"), 10, 64)
+		} else if event.EventType == "workflow_job" {
+			ciStatus.JobName = ext(m, "workflow_job", "name")
+			ciStatus.RunID, _ = strconv.ParseInt(ext(m, "workflow_job", "run_id"), 10, 64)
+			ciStatus.ParentRunID = ciStatus.RunID
+		}
+		detail.CIStatuses = []CIStatus{ciStatus}
+		detailJson, _ := json.Marshal(detail)
+
 		if _, insertErr := DB.NewInsert().Model(&MessageRecord{
 			GithubID:          githubID,
 			FeishuMessageID:   parentMsgID, // 指向父消息，用于查询

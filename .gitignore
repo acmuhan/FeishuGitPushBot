@@ -4,3 +4,7 @@
 .zed
 main
 FeishuGitPushBot
+.DS_Store
+*.test
+*.db
+*.sqlite*
