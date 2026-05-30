@@ -777,9 +777,14 @@ func processWebhookEvent(event WebhookEvent) error {
 				OrderExpr("CASE event_type WHEN 'create' THEN 0 ELSE 1 END").
 				Order("id ASC").
 				Limit(1).Scan(ctx); err == nil {
-				parentID = record.FeishuMessageID
-				parentMsgID = record.FeishuMessageID
-				slog.Info("CI event found parent by head_sha", "sha", sha, "parent_event", record.EventType, "parent_id", parentID)
+				// 父消息过旧（workflow 重新运行），不内联，创建独立消息
+				if time.Since(record.UpdatedAt) > getMergeWindow() {
+					slog.Info("CI event: parent too old, creating standalone message", "sha", sha, "parent_id", record.FeishuMessageID, "parent_age", time.Since(record.UpdatedAt))
+				} else {
+					parentID = record.FeishuMessageID
+					parentMsgID = record.FeishuMessageID
+					slog.Info("CI event found parent by head_sha", "sha", sha, "parent_event", record.EventType, "parent_id", parentID)
+				}
 			} else {
 				slog.Warn("CI event: no parent found by head_sha", "sha", sha, "repo", repo, "error", err)
 			}
@@ -843,7 +848,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
-	// 4.9 CI 事件合并：同一 commit 的多个 workflow 合并显示
+	// 4.9 CI 事件合并：同一 commit 的多个 workflow 合并显示（仅在合并窗口内）
 	if isCIEvent && parentMsgID == "" && sha != "" {
 		var existingCIRecord MessageRecord
 		if err := DB.NewSelect().Model(&existingCIRecord).
@@ -851,6 +856,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			Where("head_sha = ?", sha).
 			Where("repo_name = ?", repo).
 			Where("parent_msg_id = ''").
+			Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
 			Order("id ASC").Limit(1).Scan(ctx); err == nil {
 			// 找到同一 commit 的 CI 消息，合并 CI 状态
 			var existingDetail EventDetail
