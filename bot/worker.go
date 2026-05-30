@@ -633,6 +633,7 @@ func processWebhookEvent(event WebhookEvent) error {
 				new.Text = old.Text + "\n---\n" + new.Text
 				new.Title = "🍏 Branch Push"
 				new.EventCount = len(strings.Split(new.Text, "\n"))
+				new.CommitCount = old.CommitCount + new.CommitCount
 				currentTime := new.EventTime
 				if old.EventTime != "" {
 					new.EventTime = old.EventTime // 保留最早时间

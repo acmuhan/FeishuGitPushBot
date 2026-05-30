@@ -38,7 +38,8 @@ type EventDetail struct {
 	CIStatuses []CIStatus `json:"ci_statuses,omitempty"`
 	// 合并事件：记录时间范围和数量
 	EventTimeEnd string `json:"event_time_end,omitempty"` // 合并事件的最后时间
-	EventCount   int    `json:"event_count,omitempty"`     // 合并事件中的条目数
+	EventCount   int    `json:"event_count,omitempty"`     // 合并事件中的条目数（按 commit 计）
+	CommitCount  int    `json:"commit_count,omitempty"`    // push 事件的 commit 总数（用于折叠）
 }
 
 // CIStatus 单条 CI/Workflow 运行状态
@@ -213,6 +214,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 			} else {
 				d.Text = strings.Join(lines, "\n")
 			}
+			d.CommitCount = len(e.Commits)
 		} else if e.GetDeleted() {
 			if isTag {
 				d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", refShort)
@@ -897,6 +899,30 @@ func ParseEvent(event any, eventType string) EventDetail {
 	return d
 }
 
+// splitCommits 将 push 事件的文本按 commit 条目拆分
+// 每个 commit 以 🔸 或 🔹 开头，占一行（可能包含多行子内容）
+func splitCommits(text string) []string {
+	lines := strings.Split(text, "\n")
+	var commits []string
+	var current strings.Builder
+	for _, line := range lines {
+		if strings.HasPrefix(line, "🔸 ") || strings.HasPrefix(line, "🔹 ") {
+			if current.Len() > 0 {
+				commits = append(commits, current.String())
+				current.Reset()
+			}
+			current.WriteString(line)
+		} else if current.Len() > 0 {
+			current.WriteString("\n")
+			current.WriteString(line)
+		}
+	}
+	if current.Len() > 0 {
+		commits = append(commits, current.String())
+	}
+	return commits
+}
+
 // titleCase 将字符串首字母大写（替代已废弃的 strings.Title）
 func titleCase(s string) string {
 	if s == "" {
@@ -1388,13 +1414,17 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	// --- 2. 详情内容 ---
 	if detail.Text != "" {
 		card.AddDivider()
-		// Push 事件：超过 3 条 commit 时折叠
-		if detail.Action == "push" && !detail.IsDeleted && detail.EventCount > 3 {
-			lines := strings.Split(detail.Text, "\n")
-			visible := strings.Join(lines[:3], "\n")
-			remaining := strings.Join(lines[3:], "\n")
+		// Push 事件：超过 3 条 commit 时按 commit 折叠
+		commitCount := detail.CommitCount
+		if commitCount == 0 {
+			commitCount = detail.EventCount
+		}
+		if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
+			commits := splitCommits(detail.Text)
+			visible := strings.Join(commits[:3], "\n")
+			remaining := strings.Join(commits[3:], "\n")
 			card.AddMarkdown(visible)
-			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(lines)-3), remaining)
+			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
 		} else {
 			card.AddMarkdown(detail.Text)
 		}
