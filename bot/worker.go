@@ -658,7 +658,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			mergeSearch{githubIDLike: fmt.Sprintf("push:%s:refs/heads/%%", repo), recordType: "deleted", withinWindow: true},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
-					new.Text = old.Text + "\n---\n" + new.Text
+					new.Text = old.Text + "\n" + new.Text
 				}
 				new.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repo)
 				new.RefName = ""
@@ -696,6 +696,31 @@ func processWebhookEvent(event WebhookEvent) error {
 			},
 			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
 			"Tag deletions combined",
+		)
+		if merged {
+			return err
+		}
+	}
+
+	// 4.4a 分支删除合并：同一仓库在合并窗口内的分支删除合并（delete 事件）
+	if event.EventType == "delete" && detail.IsDeleted && !detail.IsTag {
+		merged, err := tryMergeWithExisting(ctx,
+			mergeSearch{githubIDLike: fmt.Sprintf("delete:%s:branch:%%", repo), withinWindow: true},
+			func(old, new *EventDetail) {
+				if old.Text != "" {
+					new.Text = old.Text + "\n" + new.Text
+				}
+				new.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repo)
+				new.RefName = ""
+				new.RefURL = ""
+				currentTime := new.EventTime
+				if old.EventTime != "" {
+					new.EventTime = old.EventTime
+				}
+				new.EventTimeEnd = currentTime
+			},
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"Branch deletions combined",
 		)
 		if merged {
 			return err
