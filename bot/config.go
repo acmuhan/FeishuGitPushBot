@@ -1,7 +1,7 @@
 package bot
 
 import (
-	"log"
+	"log/slog"
 	"strings"
 
 	"github.com/knadh/koanf/parsers/dotenv"
@@ -15,8 +15,6 @@ type Config struct {
 	Feishu struct {
 		AppID     string `koanf:"app_id"`
 		AppSecret string `koanf:"app_secret"`
-		Webhook   string `koanf:"webhook"`
-		Secret    string `koanf:"secret"`
 		ChatID    string `koanf:"chat_id"`
 	} `koanf:"feishu"`
 	Github struct {
@@ -27,7 +25,8 @@ type Config struct {
 		URL string `koanf:"url"`
 	} `koanf:"database"`
 	Events struct {
-		MergeWindow int `koanf:"merge_window"` // 同类事件合并窗口（分钟），默认 10
+		MergeWindow       int `koanf:"merge_window"`        // 同类事件合并窗口（分钟），默认 10
+		ThreadReplyWindow int `koanf:"thread_reply_window"` // 话题回复窗口（分钟），超过此时间的父消息不再以话题回复，默认 60
 	} `koanf:"events"`
 	Security struct {
 		AllowedIPs string `koanf:"allowed_ips"` // GitHub Webhook 来源 IP 白名单（CIDR，逗号分隔），留空则不校验
@@ -63,6 +62,9 @@ func LoadConfig() {
 		if s == "events_merge_window" {
 			return "events.merge_window"
 		}
+		if s == "events_thread_reply_window" {
+			return "events.thread_reply_window"
+		}
 		if s == "github_webhook_ips" {
 			return "security.allowed_ips"
 		}
@@ -70,26 +72,32 @@ func LoadConfig() {
 	}), nil)
 
 	if err != nil {
-		log.Fatalf("failed to load environment variables: %v", err)
+		slog.Error("failed to load environment variables", "error", err)
+		panic("failed to load environment variables")
 	}
 
 	// 将配置解析到全局变量 C
 	if err := k.Unmarshal("", &C); err != nil {
-		log.Fatalf("failed to unmarshal configuration: %v", err)
+		slog.Error("failed to unmarshal configuration", "error", err)
+		panic("failed to unmarshal configuration")
 	}
 
 	// 打印关键配置状态
-	if C.Feishu.Webhook == "" && (C.Feishu.AppID == "" || C.Feishu.AppSecret == "") {
-		log.Println("Warning: Both Webhook and AppID/AppSecret are not set, message sending might be limited")
+	if C.Feishu.AppID == "" || C.Feishu.AppSecret == "" {
+		slog.Warn("AppID or AppSecret not set, message sending might be limited")
 	}
 	if C.Database.URL == "" {
-		log.Println("Warning: DATABASE_URL is not set, message records will not be saved for updates or replies")
+		slog.Warn("DATABASE_URL is not set, message records will not be saved for updates or replies")
 	}
 	if C.Events.MergeWindow == 0 {
 		C.Events.MergeWindow = 10 // 默认 10 分钟
 	}
-	log.Printf("Event merge window: %d minutes", C.Events.MergeWindow)
+	if C.Events.ThreadReplyWindow == 0 {
+		C.Events.ThreadReplyWindow = 60 // 默认 60 分钟
+	}
+	slog.Info("Event merge window", "minutes", C.Events.MergeWindow)
+	slog.Info("Thread reply window", "minutes", C.Events.ThreadReplyWindow)
 	if C.Security.AllowedIPs != "" {
-		log.Printf("Webhook IP whitelist enabled: %s", C.Security.AllowedIPs)
+		slog.Info("Webhook IP whitelist enabled", "ips", C.Security.AllowedIPs)
 	}
 }

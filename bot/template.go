@@ -38,7 +38,8 @@ type EventDetail struct {
 	CIStatuses []CIStatus `json:"ci_statuses,omitempty"`
 	// 合并事件：记录时间范围和数量
 	EventTimeEnd string `json:"event_time_end,omitempty"` // 合并事件的最后时间
-	EventCount   int    `json:"event_count,omitempty"`     // 合并事件中的条目数
+	EventCount   int    `json:"event_count,omitempty"`     // 合并事件中的条目数（按 commit 计）
+	CommitCount  int    `json:"commit_count,omitempty"`    // push 事件的 commit 总数（用于折叠）
 }
 
 // CIStatus 单条 CI/Workflow 运行状态
@@ -213,6 +214,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 			} else {
 				d.Text = strings.Join(lines, "\n")
 			}
+			d.CommitCount = len(e.Commits)
 		} else if e.GetDeleted() {
 			if isTag {
 				d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", refShort)
@@ -698,15 +700,18 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 
 	case *github.DeleteEvent:
+		ref := e.GetRef()
 		if e.GetRefType() == "tag" {
-			ref := e.GetRef()
 			d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", ref)
 			d.RefName = ref
 			d.IsTag = true
 			d.IsDeleted = true
 			d.Text = fmt.Sprintf("🗑️ %s", ref)
 		} else {
-			d.Skip = true
+			d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", ref)
+			d.RefName = ref
+			d.IsDeleted = true
+			d.Text = fmt.Sprintf("🗑️ %s", ref)
 		}
 
 	case *github.PublicEvent:
@@ -759,12 +764,20 @@ func ParseEvent(event any, eventType string) EventDetail {
 			}
 		}
 		d.Title = fmt.Sprintf("🏢 Org %s: %s", org.GetLogin(), e.GetAction())
-		d.Text = fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), login)
+		text := fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), login)
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != login {
+			text += fmt.Sprintf("\nBy: **%s**", sender.GetLogin())
+		}
+		d.Text = text
 		d.Action = e.GetAction()
 		d.URL = org.GetHTMLURL()
 		if login != "" && login != "****" {
 			d.AuthorLogins = []string{login}
 			d.AuthorAvatars = []string{member.GetAvatarURL()}
+		}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != login {
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
 		}
 		if ts := org.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Format(time.RFC3339)
@@ -791,11 +804,19 @@ func ParseEvent(event any, eventType string) EventDetail {
 			return d
 		}
 		d.Title = fmt.Sprintf("👤 Member %s: %s", member.GetLogin(), e.GetAction())
-		d.Text = fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), member.GetLogin())
+		text := fmt.Sprintf("Action: **%s**\nMember: **%s**", e.GetAction(), member.GetLogin())
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			text += fmt.Sprintf("\nBy: **%s**", sender.GetLogin())
+		}
+		d.Text = text
 		d.Action = e.GetAction()
 		d.URL = member.GetHTMLURL()
 		d.AuthorLogins = []string{member.GetLogin()}
 		d.AuthorAvatars = []string{member.GetAvatarURL()}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
+		}
 		if ts := member.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Format(time.RFC3339)
 		}
@@ -862,12 +883,44 @@ func ParseEvent(event any, eventType string) EventDetail {
 			return d
 		}
 		d.Title = fmt.Sprintf("👥 Membership %s: %s", member.GetLogin(), e.GetAction())
-		d.Text = fmt.Sprintf("Action: **%s**\nMember: **%s**\nScope: **%s**", e.GetAction(), member.GetLogin(), e.GetScope())
+		text := fmt.Sprintf("Action: **%s**\nMember: **%s**\nScope: **%s**", e.GetAction(), member.GetLogin(), e.GetScope())
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			text += fmt.Sprintf("\nBy: **%s**", sender.GetLogin())
+		}
+		d.Text = text
 		d.Action = e.GetAction()
 		d.AuthorLogins = []string{member.GetLogin()}
 		d.AuthorAvatars = []string{member.GetAvatarURL()}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != member.GetLogin() {
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
+		}
 	}
 	return d
+}
+
+// splitCommits 将 push 事件的文本按 commit 条目拆分
+// 每个 commit 以 🔸 或 🔹 开头，占一行（可能包含多行子内容）
+func splitCommits(text string) []string {
+	lines := strings.Split(text, "\n")
+	var commits []string
+	var current strings.Builder
+	for _, line := range lines {
+		if strings.HasPrefix(line, "🔸 ") || strings.HasPrefix(line, "🔹 ") {
+			if current.Len() > 0 {
+				commits = append(commits, current.String())
+				current.Reset()
+			}
+			current.WriteString(line)
+		} else if current.Len() > 0 {
+			current.WriteString("\n")
+			current.WriteString(line)
+		}
+	}
+	if current.Len() > 0 {
+		commits = append(commits, current.String())
+	}
+	return commits
 }
 
 // titleCase 将字符串首字母大写（替代已废弃的 strings.Title）
@@ -963,7 +1016,7 @@ func parseRunIDFromURL(url string) int64 {
 }
 
 // getCIStatusesForParent 查询关联到指定父消息的所有 CI 事件状态
-// 从每条 CI 记录的 EventDetail 构造 CIStatus（CI 记录不单独存储 CIStatuses）
+// 优先从 EventDetail.CIStatuses 读取结构化数据，回退到标题解析（兼容旧记录）
 func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus {
 	if DB == nil || parentMsgID == "" {
 		return nil
@@ -981,8 +1034,26 @@ func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus 
 	for _, r := range records {
 		var detail EventDetail
 		_ = json.Unmarshal([]byte(r.Content), &detail)
-		// 从 EventDetail 的 Title 提取 CI 状态信息
-		// Title 格式: "✅ Workflow Succeeded: CI" / "❌ Workflow Failed: CI" / "✅ Check: lint"
+
+		// 优先使用结构化的 CIStatuses 字段
+		if len(detail.CIStatuses) > 0 {
+			for _, cs := range detail.CIStatuses {
+				key := cs.WorkflowName
+				if cs.JobName != "" {
+					key = cs.JobName
+				}
+				if !seen[key] {
+					seen[key] = true
+					if cs.UpdatedAt == "" {
+						cs.UpdatedAt = r.UpdatedAt.Format(time.RFC3339)
+					}
+					statuses = append(statuses, cs)
+				}
+			}
+			continue
+		}
+
+		// 回退：从 Title 解析（兼容旧记录）
 		workflowName := ""
 		titleParts := strings.SplitN(detail.Title, ": ", 2)
 		if len(titleParts) > 1 {
@@ -1004,7 +1075,6 @@ func getCIStatusesForParent(ctx context.Context, parentMsgID string) []CIStatus 
 		key := workflowName
 		if !seen[key] {
 			seen[key] = true
-			// 从 Text 中提取耗时信息
 			duration := ""
 			if idx := strings.Index(detail.Text, " in "); idx >= 0 {
 				duration = strings.TrimSpace(detail.Text[idx+4:])
@@ -1361,13 +1431,17 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	// --- 2. 详情内容 ---
 	if detail.Text != "" {
 		card.AddDivider()
-		// Push 事件：超过 3 条 commit 时折叠
-		if detail.Action == "push" && !detail.IsDeleted && detail.EventCount > 3 {
-			lines := strings.Split(detail.Text, "\n")
-			visible := strings.Join(lines[:3], "\n")
-			remaining := strings.Join(lines[3:], "\n")
+		// Push 事件：超过 3 条 commit 时按 commit 折叠
+		commitCount := detail.CommitCount
+		if commitCount == 0 {
+			commitCount = detail.EventCount
+		}
+		if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
+			commits := splitCommits(detail.Text)
+			visible := strings.Join(commits[:3], "\n")
+			remaining := strings.Join(commits[3:], "\n")
 			card.AddMarkdown(visible)
-			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(lines)-3), remaining)
+			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
 		} else {
 			card.AddMarkdown(detail.Text)
 		}
@@ -1409,7 +1483,10 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	// --- 5. 事件发生时间 ---
 	if detail.EventTime != "" {
 		if t, err := time.Parse(time.RFC3339, detail.EventTime); err == nil {
-			loc, _ := time.LoadLocation("Asia/Shanghai")
+			loc, err := time.LoadLocation("Asia/Shanghai")
+			if err != nil {
+				loc = time.UTC
+			}
 			timeStr := t.In(loc).Format("2006-01-02 15:04:05")
 			// 合并事件显示时间范围
 			if detail.EventTimeEnd != "" {
@@ -1449,19 +1526,6 @@ func SafeText(s string, maxRunes int) string {
 		return string(runes[:maxRunes]) + "..."
 	}
 	return s
-}
-
-// truncateAtLine 在行边界处截断文本，保留不超过 maxRunes 个字符的完整行
-func truncateAtLine(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
-	}
-	truncated := string(runes[:maxRunes])
-	if idx := strings.LastIndex(truncated, "\n"); idx > 0 {
-		truncated = truncated[:idx]
-	}
-	return truncated + "\n..."
 }
 
 var conventionalRegex = regexp.MustCompile(`(?i)(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|ref)(\([^)]+\))?(!?):`)
@@ -1608,10 +1672,10 @@ func htmlToMarkdown(s string) string {
 	s = convertBlockTags(s)
 
 	// Step 4: 移除残留的 HTML 标签
-	s = regexp.MustCompile(`(?s)<[^>]*>`).ReplaceAllString(s, "")
+	s = reStripHTML.ReplaceAllString(s, "")
 
 	// Step 5: 清理多余空白
-	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+	s = reMultiNewline.ReplaceAllString(s, "\n\n")
 	s = strings.TrimSpace(s)
 
 	return s
@@ -1635,6 +1699,9 @@ var (
 	reLi         = regexp.MustCompile(`(?is)<li\s*>(.*?)</li>`)
 	reBq         = regexp.MustCompile(`(?is)<blockquote\s*>(.*?)</blockquote>`)
 	reHr         = regexp.MustCompile(`(?is)<hr\s*/?>`)
+	reStripHTML    = regexp.MustCompile(`(?s)<[^>]*>`)
+	reMultiNewline = regexp.MustCompile(`\n{3,}`)
+	reDetails      = regexp.MustCompile(`(?is)<details.*?>\s*<summary.*?>(.*?)</summary>(.*?)</details>`)
 )
 
 func convertInlineTags(s string) string {
@@ -1726,18 +1793,17 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 	s = strings.ReplaceAll(s, "```mermaid", "```")
 
 	// 2. 提取 <details> <summary> 折叠内容
-	reDetails := regexp.MustCompile(`(?is)<details.*?>\s*<summary.*?>(.*?)</summary>(.*?)</details>`)
 	var foldables []string
 
 	processed := reDetails.ReplaceAllStringFunc(s, func(m string) string {
 		match := reDetails.FindStringSubmatch(m)
 		if len(match) > 2 {
 			title := strings.TrimSpace(match[1])
-			title = regexp.MustCompile(`(?s)<[^>]*>`).ReplaceAllString(title, "")
+			title = reStripHTML.ReplaceAllString(title, "")
 
 			content := strings.TrimSpace(match[2])
 			content = htmlToMarkdown(content)
-			content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
+			content = reMultiNewline.ReplaceAllString(content, "\n\n")
 
 			foldables = append(foldables, fmt.Sprintf("**%s**\n%s", title, strings.TrimSpace(content)))
 		}
@@ -1756,9 +1822,9 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 }
 
 // GetDiffOnlyAdded 生成仅包含新增内容的 Diff
-func GetDiffOnlyAdded(old, new string) string {
+func GetDiffOnlyAdded(old, newStr string) string {
 	if old == "" {
-		return new
+		return newStr
 	}
 
 	oldLines := strings.Split(old, "\n")
@@ -1767,7 +1833,7 @@ func GetDiffOnlyAdded(old, new string) string {
 		oldMap[l] = true
 	}
 
-	newLines := strings.Split(new, "\n")
+	newLines := strings.Split(newStr, "\n")
 	var diff []string
 	for _, l := range newLines {
 		if !oldMap[l] {

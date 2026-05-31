@@ -3,14 +3,18 @@ package bot
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"log"
+	"embed"
+	"log/slog"
 	"time"
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/driver/pgdriver"
+	"github.com/uptrace/bun/migrate"
 )
+
+//go:embed migrations/*.sql
+var sqlMigrations embed.FS
 
 var DB *bun.DB
 
@@ -70,6 +74,8 @@ type WebhookEvent struct {
 	Status         string    `bun:",default:'pending'"` // pending, processed, failed
 	RetryCount     int       `bun:",default:0"`
 	RescheduleCount int      `bun:",default:0"` // CI 事件等待 push 事件的重调度次数
+	HeadSHA         string   `bun:""`           // 从 payload 中提取的 head SHA，用于快速 CI 重调度查找
+	Ref             string   `bun:""`           // 分支/标签引用，用于 CI 重调度时关联 create 事件
 	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
@@ -84,78 +90,34 @@ type ImageCache struct {
 	UpdatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
-// InitDB 初始化数据库连接并执行自动迁移
+// InitDB 初始化数据库连接并执行 SQL 迁移
 func InitDB() {
 	if C.Database.URL == "" {
-		log.Println("Skipping database initialization: DATABASE_URL not set")
+		slog.Warn("Skipping database initialization: DATABASE_URL not set")
 		return
 	}
 
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(C.Database.URL)))
 	db := bun.NewDB(sqldb, pgdialect.New())
-
-	// 自动迁移
-	ctx := context.Background()
-	_, err := db.NewCreateTable().Model((*MessageRecord)(nil)).IfNotExists().Exec(ctx)
-	if err != nil {
-		log.Printf("Database migration failed (skipping database features): %v", err)
-		return
-	}
-
-	_, err = db.NewCreateTable().Model((*ImageCache)(nil)).IfNotExists().Exec(ctx)
-	if err != nil {
-		log.Printf("Image cache migration failed (skipping image cache): %v", err)
-		return
-	}
-
-	_, err = db.NewCreateTable().Model((*WebhookEvent)(nil)).IfNotExists().Exec(ctx)
-	if err != nil {
-		log.Printf("Webhook event table migration failed: %v", err)
-		return
-	}
-
 	DB = db
-	log.Println("Database initialization successful")
 
-	// 自动补齐缺失的列（ALTER TABLE ADD COLUMN IF NOT EXISTS）
-	migrateDB(db)
-}
-
-// migrateDB 自动检测并补齐已存在表中缺失的列。
-// 使用 PostgreSQL 原生的 ADD COLUMN IF NOT EXISTS 语法，幂等安全。
-func migrateDB(db *bun.DB) {
-	type migration struct {
-		table  string
-		column string
-		typ    string
+	// 运行 SQL 迁移（建表 + 加列，全部由 migrations/ 目录管理）
+	ctx := context.Background()
+	migrations := migrate.NewMigrations()
+	if err := migrations.Discover(sqlMigrations); err != nil {
+		slog.Error("Failed to discover SQL migrations", "error", err)
+		return
 	}
-	migrations := []migration{
-		// MessageRecord
-		{"message_records", "event_id", "BIGINT NOT NULL DEFAULT 0"},
-		{"message_records", "head_sha", "TEXT"},
-		{"message_records", "image_status", "TEXT DEFAULT 'done'"},
-		{"message_records", "avatar_url", "TEXT"},
-		{"message_records", "workflow_started_at", "TIMESTAMPTZ"},
-		{"message_records", "timeout_notified", "BOOLEAN DEFAULT FALSE"},
-		{"message_records", "record_type", "TEXT DEFAULT 'normal'"},
-		{"message_records", "parent_msg_id", "TEXT"},
-		{"message_records", "sender", "TEXT"},
-		{"message_records", "sender_url", "TEXT"},
-		{"message_records", "avatar_url2", "TEXT"},
-		// WebhookEvent
-		{"webhook_events", "hook_id", "BIGINT"},
-		{"webhook_events", "reschedule_count", "INT DEFAULT 0"},
-		// ImageCache
-		{"image_caches", "hash", "TEXT"},
+	migrator := migrate.NewMigrator(db, migrations)
+	group, err := migrator.Migrate(ctx)
+	if err != nil {
+		slog.Error("SQL migration failed", "error", err)
+		return
 	}
-
-	for _, m := range migrations {
-		_, err := db.Exec(fmt.Sprintf(
-			"ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
-			m.table, m.column, m.typ,
-		))
-		if err != nil {
-			log.Printf("Migration warning: %s.%s — %v", m.table, m.column, err)
-		}
+	if group.IsZero() {
+		slog.Info("SQL migrations up to date")
+	} else {
+		slog.Info("SQL migrations applied", "group", group.ID)
 	}
+	slog.Info("Database initialization successful")
 }
