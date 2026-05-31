@@ -109,6 +109,10 @@ func InitDB() {
 		return
 	}
 	migrator := migrate.NewMigrator(db, migrations)
+	if err := migrator.Init(ctx); err != nil {
+		slog.Error("Failed to init migration tables", "error", err)
+		return
+	}
 	group, err := migrator.Migrate(ctx)
 	if err != nil {
 		slog.Error("SQL migration failed", "error", err)
