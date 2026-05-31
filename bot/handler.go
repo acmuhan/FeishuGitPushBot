@@ -80,6 +80,12 @@ func GithubHandler(c *gin.Context) {
 			headSHA = ext(payloadMap, "after")
 		}
 
+		// 提取 ref 用于 CI 重调度时关联 create 事件
+		ref := ext(payloadMap, "ref")
+		if ref == "" {
+			ref = ext(payloadMap, "workflow_run", "head_branch")
+		}
+
 		_, err := DB.NewInsert().Model(&WebhookEvent{
 			DeliveryID: deliveryID,
 			EventType:  eventType,
@@ -87,6 +93,7 @@ func GithubHandler(c *gin.Context) {
 			Payload:    string(payload),
 			Status:     "pending",
 			HeadSHA:    headSHA,
+			Ref:        ref,
 		}).Exec(c.Request.Context())
 		if err != nil {
 			slog.Error("Failed to record Webhook event",

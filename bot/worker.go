@@ -209,6 +209,24 @@ func findParentRecordBySHA(ctx context.Context, repo, sha string) *MessageRecord
 	return nil
 }
 
+// findRecentRepoTag 查找同一仓库最近的 tag 创建消息（用于 CI 事件关联，tag 的 head_sha 可能为空）
+// 排除已删除的消息记录
+func findRecentRepoTag(ctx context.Context, repo string) *MessageRecord {
+	if repo == "" {
+		return nil
+	}
+	var record MessageRecord
+	if err := DB.NewSelect().Model(&record).
+		Where("repo_name = ?", repo).
+		Where("event_type = ?", "create").
+		Where("record_type != 'deleted'").
+		Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
+		Order("id DESC").Limit(1).Scan(ctx); err == nil {
+		return &record
+	}
+	return nil
+}
+
 // findRecentRepoPush 查找同一仓库最近的推送消息（用于 tag/workflow 关联 commit）
 // 排除已删除的消息记录
 func findRecentRepoPush(ctx context.Context, repo string) string {
@@ -850,16 +868,43 @@ func processWebhookEvent(event WebhookEvent) error {
 				slog.Warn("CI event: no parent found by head_sha", "sha", sha, "repo", repo, "error", err)
 			}
 		}
-		// 找不到父消息，检查关联的 push 事件是否还在队列中或等待重试（事件到达顺序不确定）
-		if parentID == "" && sha != "" && event.RescheduleCount < 5 {
-			var pendingPush WebhookEvent
-			if err := DB.NewSelect().Model(&pendingPush).
-				Where("event_type = ?", "push").
-				Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
-				Where("head_sha = ?", sha).
-				Limit(1).Scan(ctx); err == nil {
-				// 改回 pending 重新排队，不增加 retry_count，避免耗尽重试次数
-				slog.Info("Rescheduling CI event, waiting for push", "sha", sha, "event_type", event.EventType, "reschedule", event.RescheduleCount+1)
+		// SHA 匹配失败时，回退查找同仓库最近的 tag 创建消息（tag 的 head_sha 可能为空）
+		if isCIEvent && parentID == "" {
+			if rec := findRecentRepoTag(ctx, repo); rec != nil {
+				parentID = rec.FeishuMessageID
+				parentMsgID = rec.FeishuMessageID
+				slog.Info("CI event found parent by recent tag fallback", "parent_event", rec.EventType, "parent_id", parentID)
+			}
+		}
+		// 找不到父消息，检查关联的 push/create 事件是否还在队列中或等待重试（事件到达顺序不确定）
+		if isCIEvent && parentID == "" && event.RescheduleCount < 5 {
+			shouldReschedule := false
+			if sha != "" {
+				// 同 SHA 的 push 事件还在队列中
+				var pendingPush WebhookEvent
+				if err := DB.NewSelect().Model(&pendingPush).
+					Where("id != ?", event.ID).
+					Where("event_type = ?", "push").
+					Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
+					Where("head_sha = ?", sha).
+					Limit(1).Scan(ctx); err == nil {
+					shouldReschedule = true
+				}
+			}
+			// tag 触发的 workflow：create 事件可能还在队列中（head_sha 为空，无法用 SHA 关联）
+			if !shouldReschedule && ref != "" {
+				var pendingCreate WebhookEvent
+				if err := DB.NewSelect().Model(&pendingCreate).
+					Where("id != ?", event.ID).
+					Where("event_type = ?", "create").
+					Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
+					Where("ref = ?", ref).
+					Limit(1).Scan(ctx); err == nil {
+					shouldReschedule = true
+				}
+			}
+			if shouldReschedule {
+				slog.Info("Rescheduling CI event, waiting for parent event", "sha", sha, "ref", ref, "event_type", event.EventType, "reschedule", event.RescheduleCount+1)
 				_, _ = DB.NewUpdate().Model(&event).
 					Set("status = ?", "pending").
 					Set("reschedule_count = reschedule_count + 1").
