@@ -196,34 +196,23 @@ func ParseEvent(event any, eventType string) EventDetail {
 
 				lines = append(lines, fmt.Sprintf("%s %s%s%s", emojiIcon, msg, hashPart, authorPart))
 			}
-			// 如果某条提交的消息包含 markdown 列表，紧跟 \n 无法断开列表上下文
-			// 则在该行后插入空行（\n\n）以强制结束列表
-			if len(lines) > 1 {
-				var sb strings.Builder
-				for i, line := range lines {
-					if i > 0 {
-						if containsMarkdownList(lines[i-1]) {
-							sb.WriteString("\n\n")
-						} else {
-							sb.WriteString("\n")
-						}
-					}
-					sb.WriteString(line)
-				}
-				d.Text = sb.String()
-			} else {
-				d.Text = strings.Join(lines, "\n")
-			}
+			// 飞书卡片 markdown 中 \n 为软换行（可能被忽略），<br> 为硬换行（始终生效）
+			// 用 <br> 分隔各条 commit，保证换行且不会有段落间距
+			d.Text = strings.Join(lines, "<br>")
 			d.CommitCount = len(e.Commits)
 		} else if e.GetDeleted() {
+			repoName := ""
+			if repo := e.GetRepo(); repo != nil {
+				repoName = repo.GetName()
+			}
 			if isTag {
-				d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", refShort)
+				d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", repoName)
 				d.IsDeleted = true
 			} else {
-				d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", refShort)
+				d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repoName)
 				d.IsDeleted = true
 			}
-			d.Text = fmt.Sprintf("🌿 %s", refShort)
+			d.Text = refShort
 		} else if e.GetCreated() {
 			if isTag {
 				d.Title = fmt.Sprintf("🏷️ New Tag: %s", refShort)
@@ -701,17 +690,21 @@ func ParseEvent(event any, eventType string) EventDetail {
 
 	case *github.DeleteEvent:
 		ref := e.GetRef()
+		repoName := ""
+		if repo := e.GetRepo(); repo != nil {
+			repoName = repo.GetName()
+		}
 		if e.GetRefType() == "tag" {
-			d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", ref)
+			d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", repoName)
 			d.RefName = ref
 			d.IsTag = true
 			d.IsDeleted = true
-			d.Text = fmt.Sprintf("🗑️ %s", ref)
+			d.Text = ref
 		} else {
-			d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", ref)
+			d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repoName)
 			d.RefName = ref
 			d.IsDeleted = true
-			d.Text = fmt.Sprintf("🗑️ %s", ref)
+			d.Text = ref
 		}
 
 	case *github.PublicEvent:
@@ -868,7 +861,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		if body := release.GetBody(); body != "" {
 			text, _ := ProcessGithubMarkdown(body)
 			if text != "" {
-				lines = append(lines, "", "**Release Notes:**", text)
+				lines = append(lines, "---", "**Release Notes:**", text)
 			}
 		}
 		d.Text = strings.Join(lines, "\n")
@@ -895,30 +888,484 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
 			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
 		}
+
+	case *github.CommitCommentEvent:
+		comment := e.GetComment()
+		if comment == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("💬 Commit Comment %s", action)
+		d.Action = action
+		body, foldable := ProcessGithubMarkdown(comment.GetBody())
+		d.FoldableBody = foldable
+		if body != "" {
+			d.Text = fmt.Sprintf("**Commit comment**\n%s", body)
+		} else {
+			d.Text = "**Commit comment**"
+		}
+		d.URL = comment.GetHTMLURL()
+		if ts := comment.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.DeploymentEvent:
+		deployment := e.GetDeployment()
+		if deployment == nil {
+			d.Skip = true
+			return d
+		}
+		d.Title = "🚀 Deployment Created"
+		env := deployment.GetEnvironment()
+		ref := deployment.GetRef()
+		desc := deployment.GetDescription()
+		var lines []string
+		if env != "" {
+			lines = append(lines, fmt.Sprintf("**Environment:** `%s`", env))
+		}
+		if ref != "" {
+			lines = append(lines, fmt.Sprintf("**Ref:** `%s`", ref))
+		}
+		if desc != "" {
+			lines = append(lines, desc)
+		}
+		if task := deployment.GetTask(); task != "" {
+			lines = append(lines, fmt.Sprintf("**Task:** `%s`", task))
+		}
+		d.Text = strings.Join(lines, "\n")
+		d.URL = deployment.GetURL()
+		if ts := deployment.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.DeploymentStatusEvent:
+		ds := e.GetDeploymentStatus()
+		deployment := e.GetDeployment()
+		if ds == nil || deployment == nil {
+			d.Skip = true
+			return d
+		}
+		state := ds.GetState()
+		icon := "📊"
+		switch state {
+		case "success":
+			icon = "✅"
+		case "failure", "error":
+			icon = "❌"
+		case "pending":
+			icon = "⏳"
+		}
+		d.Title = fmt.Sprintf("%s Deployment %s", icon, titleCase(state))
+		d.Action = e.GetAction()
+		var lines []string
+		if env := deployment.GetEnvironment(); env != "" {
+			lines = append(lines, fmt.Sprintf("**Environment:** `%s`", env))
+		}
+		if desc := ds.GetDescription(); desc != "" {
+			lines = append(lines, desc)
+		}
+		d.Text = strings.Join(lines, "\n")
+		d.URL = ds.GetTargetURL()
+		if ts := ds.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.DiscussionEvent:
+		disc := e.GetDiscussion()
+		if disc == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		switch action {
+		case "created":
+			d.Title = "💬 New Discussion"
+		case "answered":
+			d.Title = "✅ Discussion Answered"
+		case "closed":
+			d.Title = "💬 Discussion Closed"
+		default:
+			d.Title = fmt.Sprintf("💬 Discussion %s", action)
+		}
+		d.Action = action
+		body, foldable := ProcessGithubMarkdown(disc.GetBody())
+		d.FoldableBody = foldable
+		if body != "" {
+			d.Text = fmt.Sprintf("**%s**\n%s", disc.GetTitle(), body)
+		} else {
+			d.Text = fmt.Sprintf("**%s**", disc.GetTitle())
+		}
+		d.URL = disc.GetHTMLURL()
+		if ts := disc.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.DiscussionCommentEvent:
+		disc := e.GetDiscussion()
+		comment := e.GetComment()
+		if disc == nil || comment == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("💬 Discussion Comment %s", action)
+		d.Action = action
+		body, foldable := ProcessGithubMarkdown(comment.GetBody())
+		d.FoldableBody = foldable
+		if body != "" {
+			d.Text = fmt.Sprintf("**%s**\n%s", disc.GetTitle(), body)
+		} else {
+			d.Text = fmt.Sprintf("**%s**", disc.GetTitle())
+		}
+		d.URL = comment.GetHTMLURL()
+		if ts := comment.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.LabelEvent:
+		label := e.GetLabel()
+		if label == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🏷️ Label %s: %s", action, label.GetName())
+		d.Action = action
+		text := fmt.Sprintf("**%s**", label.GetName())
+		if desc := label.GetDescription(); desc != "" {
+			text += fmt.Sprintf("\n%s", desc)
+		}
+		if color := label.GetColor(); color != "" {
+			text += fmt.Sprintf("\n`#%s`", color)
+		}
+		d.Text = text
+
+	case *github.MilestoneEvent:
+		ms := e.GetMilestone()
+		if ms == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🎯 Milestone %s: %s", action, ms.GetTitle())
+		d.Action = action
+		var lines []string
+		if desc := ms.GetDescription(); desc != "" {
+			lines = append(lines, desc)
+		}
+		if !ms.GetDueOn().IsZero() {
+			lines = append(lines, fmt.Sprintf("**Due:** %s", ms.GetDueOn().Format("2006-01-02")))
+		}
+		lines = append(lines, fmt.Sprintf("Open: %d / Closed: %d", ms.GetOpenIssues(), ms.GetClosedIssues()))
+		d.Text = strings.Join(lines, "\n")
+		d.URL = ms.GetHTMLURL()
+		if ts := ms.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.PullRequestReviewThreadEvent:
+		pr := e.GetPullRequest()
+		if pr == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		switch action {
+		case "resolved":
+			d.Title = "✅ PR Review Thread Resolved"
+		case "unresolved":
+			d.Title = "🔓 PR Review Thread Unresolved"
+		default:
+			d.Title = fmt.Sprintf("🧵 PR Review Thread %s", action)
+		}
+		d.Action = action
+		d.Text = fmt.Sprintf("**%s**", pr.GetTitle())
+		d.URL = pr.GetHTMLURL()
+		if ts := pr.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
+
+	case *github.StatusEvent:
+		state := e.GetState()
+		context := e.GetContext()
+		icon := "📊"
+		switch state {
+		case "success":
+			icon = "✅"
+		case "failure", "error":
+			icon = "❌"
+		case "pending":
+			icon = "⏳"
+		}
+		d.Title = fmt.Sprintf("%s Status: %s", icon, context)
+		desc := e.GetDescription()
+		if desc != "" {
+			d.Text = fmt.Sprintf("**%s** %s: %s", context, state, desc)
+		} else {
+			d.Text = fmt.Sprintf("**%s** %s", context, state)
+		}
+		d.URL = e.GetTargetURL()
+		d.Action = state
+		sha := e.GetSHA()
+		if len(sha) > 7 {
+			d.SHA = sha[:7]
+		} else {
+			d.SHA = sha
+		}
+		if ts := e.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.BranchProtectionRuleEvent:
+		rule := e.GetRule()
+		if rule == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🛡️ Branch Protection Rule %s", action)
+		d.Action = action
+		d.Text = fmt.Sprintf("**%s**", rule.GetName())
+		if ts := rule.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.RepositoryRulesetEvent:
+		ruleset := e.GetRepositoryRuleset()
+		if ruleset == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("📋 Repository Ruleset %s", action)
+		d.Action = action
+		d.Text = fmt.Sprintf("**Ruleset #%d**", ruleset.GetID())
+		if ts := ruleset.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.CodeScanningAlertEvent:
+		alert := e.GetAlert()
+		if alert == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		severity := alert.GetRuleSeverity()
+		icon := "🔍"
+		switch severity {
+		case "error":
+			icon = "🔴"
+		case "warning":
+			icon = "🟡"
+		case "note":
+			icon = "🔵"
+		}
+		d.Title = fmt.Sprintf("%s Code Scanning Alert #%d %s", icon, alert.GetNumber(), action)
+		d.Action = action
+		ruleDesc := alert.GetRuleDescription()
+		if ruleDesc == "" {
+			ruleDesc = alert.GetRuleID()
+		}
+		text := fmt.Sprintf("**%s** (severity: %s)", ruleDesc, severity)
+		if ref := e.GetRef(); ref != "" {
+			text += fmt.Sprintf("\n**Ref:** `%s`", ref)
+		}
+		d.Text = text
+		d.URL = alert.GetHTMLURL()
+		if ts := alert.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.DependabotAlertEvent:
+		alert := e.GetAlert()
+		if alert == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		severity := ""
+		if sv := alert.GetSecurityVulnerability(); sv != nil {
+			severity = sv.GetSeverity()
+		}
+		icon := "🤖"
+		switch severity {
+		case "critical":
+			icon = "🔴"
+		case "high":
+			icon = "🟠"
+		case "medium":
+			icon = "🟡"
+		case "low":
+			icon = "🟢"
+		}
+		d.Title = fmt.Sprintf("%s Dependabot Alert #%d %s", icon, alert.GetNumber(), action)
+		d.Action = action
+		dep := alert.GetDependency()
+		pkgName := ""
+		if dep != nil {
+			pkgName = dep.GetPackage().GetName()
+		}
+		text := fmt.Sprintf("**%s** (severity: %s)", pkgName, severity)
+		if advisory := alert.GetSecurityAdvisory(); advisory != nil {
+			if summary := advisory.GetSummary(); summary != "" {
+				text += fmt.Sprintf("\n%s", summary)
+			}
+		}
+		d.Text = text
+		d.URL = alert.GetHTMLURL()
+		if ts := alert.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.SecretScanningAlertEvent:
+		alert := e.GetAlert()
+		if alert == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🔐 Secret Scanning Alert #%d %s", alert.GetNumber(), action)
+		d.Action = action
+		secretType := alert.GetSecretTypeDisplayName()
+		if secretType == "" {
+			secretType = alert.GetSecretType()
+		}
+		text := fmt.Sprintf("**Secret type:** %s", secretType)
+		if alert.GetPubliclyLeaked() {
+			text += "\n⚠️ **Publicly leaked**"
+		}
+		d.Text = text
+		d.URL = alert.GetHTMLURL()
+		if ts := alert.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.RepositoryVulnerabilityAlertEvent:
+		alert := e.GetAlert()
+		if alert == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		severity := alert.GetSeverity()
+		icon := "⚠️"
+		switch severity {
+		case "critical":
+			icon = "🔴"
+		case "high":
+			icon = "🟠"
+		case "medium":
+			icon = "🟡"
+		case "low":
+			icon = "🟢"
+		}
+		d.Title = fmt.Sprintf("%s Vulnerability Alert %s", icon, action)
+		d.Action = action
+		pkg := alert.GetAffectedPackageName()
+		text := fmt.Sprintf("**%s** (severity: %s)", pkg, severity)
+		if fixedIn := alert.GetFixedIn(); fixedIn != "" {
+			text += fmt.Sprintf("\n**Fixed in:** %s", fixedIn)
+		}
+		d.Text = text
+		if ref := alert.GetExternalReference(); ref != "" {
+			d.URL = ref
+		}
+		if ts := alert.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.SecurityAdvisoryEvent:
+		adv := e.GetSecurityAdvisory()
+		if adv == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		severity := adv.GetSeverity()
+		icon := "🛡️"
+		switch severity {
+		case "critical":
+			icon = "🔴"
+		case "high":
+			icon = "🟠"
+		case "medium":
+			icon = "🟡"
+		case "low":
+			icon = "🟢"
+		}
+		d.Title = fmt.Sprintf("%s Security Advisory %s", icon, action)
+		d.Action = action
+		text := fmt.Sprintf("**%s** (severity: %s)", adv.GetGHSAID(), severity)
+		if summary := adv.GetSummary(); summary != "" {
+			text += fmt.Sprintf("\n%s", summary)
+		}
+		if cve := adv.GetCVEID(); cve != "" {
+			text += fmt.Sprintf("\n**CVE:** %s", cve)
+		}
+		d.Text = text
+		d.URL = adv.GetHTMLURL()
+		if ts := adv.GetPublishedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
+
+	case *github.TeamAddEvent:
+		team := e.GetTeam()
+		if team == nil {
+			d.Skip = true
+			return d
+		}
+		d.Title = fmt.Sprintf("👥 Team Added: %s", team.GetName())
+		text := fmt.Sprintf("**Team:** [%s](%s)", team.GetName(), team.GetHTMLURL())
+		if repo := e.GetRepo(); repo != nil {
+			text += fmt.Sprintf("\n**Repo:** %s", repo.GetFullName())
+		}
+		d.Text = text
+		d.URL = team.GetHTMLURL()
+
+	case *github.PageBuildEvent:
+		build := e.GetBuild()
+		if build == nil {
+			d.Skip = true
+			return d
+		}
+		status := build.GetStatus()
+		icon := "📄"
+		stateVerb := status
+		switch status {
+		case "built":
+			icon = "✅"
+			stateVerb = "built"
+		case "building":
+			icon = "⏳"
+			stateVerb = "building"
+		case "errored":
+			icon = "❌"
+			stateVerb = "errored"
+		}
+		d.Title = fmt.Sprintf("%s Page Build %s", icon, titleCase(stateVerb))
+		d.Action = status
+		duration := time.Duration(build.GetDuration()) * time.Second
+		d.Text = fmt.Sprintf("Pages build %s in %s", status, FormatDuration(duration))
+		if ts := build.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Time.Format(time.RFC3339)
+		}
 	}
 	return d
 }
 
 // splitCommits 将 push 事件的文本按 commit 条目拆分
-// 每个 commit 以 🔸 或 🔹 开头，占一行（可能包含多行子内容）
+// 每个 commit 以 🔸 或 🔹 开头，条目间用 <br> 分隔
 func splitCommits(text string) []string {
-	lines := strings.Split(text, "\n")
+	// 条目间用 <br> 分隔（飞书硬换行）
+	parts := strings.Split(text, "<br>")
 	var commits []string
-	var current strings.Builder
-	for _, line := range lines {
-		if strings.HasPrefix(line, "🔸 ") || strings.HasPrefix(line, "🔹 ") {
-			if current.Len() > 0 {
-				commits = append(commits, current.String())
-				current.Reset()
-			}
-			current.WriteString(line)
-		} else if current.Len() > 0 {
-			current.WriteString("\n")
-			current.WriteString(line)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			commits = append(commits, part)
 		}
-	}
-	if current.Len() > 0 {
-		commits = append(commits, current.String())
 	}
 	return commits
 }
@@ -1138,7 +1585,7 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 			lines = append(lines, renderSingleCIStatus(job, repoURL, true))
 		}
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "<br>")
 }
 
 // renderSingleCIStatus 渲染单条 CI 状态
@@ -1224,6 +1671,68 @@ func makeCIActionButtons(statuses []CIStatus, repoURL string) []ActionButton {
 	return btns
 }
 
+// buildSenderText 构建发送者 markdown 文本（支持多作者）
+func buildSenderText(sender, senderUrl string, authorLogins []string) string {
+	if len(authorLogins) > 1 {
+		var links []string
+		for _, login := range authorLogins {
+			links = append(links, fmt.Sprintf("[%s](https://github.com/%s)", login, login))
+		}
+		return strings.Join(links, "  ")
+	}
+	if len(authorLogins) == 1 {
+		return fmt.Sprintf("[%s](https://github.com/%s)", authorLogins[0], authorLogins[0])
+	}
+	return fmt.Sprintf("[%s](%s)", sender, senderUrl)
+}
+
+// buildSummaryRow 构建摘要行 column_set：左列 [仓库+分支]，右列 [头像+用户名]
+// 删除事件和正常事件共用此逻辑，避免重复代码
+func buildSummaryRow(metaText, senderText string, resolvedAvatars []string) map[string]any {
+	if len(resolvedAvatars) == 0 {
+		// 无头像：纯文本一行
+		line := metaText
+		if line != "" {
+			line += " / "
+		}
+		line += "👤 " + senderText
+		return nil // 调用方应 fallback 到 AddMarkdown
+	}
+
+	// 有头像：column_set 左右布局
+	avatarEls := make([]any, 0, len(resolvedAvatars))
+	for _, key := range resolvedAvatars {
+		avatarEls = append(avatarEls, map[string]any{
+			"tag":          "img",
+			"img_key":      key,
+			"custom_width": 20,
+			"mode":         "crop_center",
+			"alt":          map[string]string{"tag": "plain_text", "content": "avatar"},
+		})
+	}
+	userEls := make([]any, 0, len(avatarEls)+1)
+	userEls = append(userEls, avatarEls...)
+	userEls = append(userEls, map[string]any{"tag": "markdown", "content": senderText})
+
+	return map[string]any{
+		"tag":                "column_set",
+		"flex_mode":          "flow",
+		"horizontal_spacing": "small",
+		"columns": []any{
+			map[string]any{
+				"tag": "column", "width": "weighted", "weight": 3,
+				"vertical_align": "center",
+				"elements":       []any{map[string]any{"tag": "markdown", "content": metaText}},
+			},
+			map[string]any{
+				"tag": "column", "width": "weighted", "weight": 2,
+				"vertical_align": "center",
+				"elements":       userEls,
+			},
+		},
+	}
+}
+
 // BuildCard 构建符合飞书卡片 V2 规范的消息卡片
 func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, detail EventDetail) *Card {
 	card := NewCard()
@@ -1276,17 +1785,7 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	metaText := strings.Join(metaParts, " / ")
 
 	// 构建发送者文本
-	senderText := fmt.Sprintf("[%s](%s)", sender, senderUrl)
-	if len(detail.AuthorLogins) > 1 {
-		var links []string
-		for _, login := range detail.AuthorLogins {
-			links = append(links, fmt.Sprintf("[%s](https://github.com/%s)", login, login))
-		}
-		senderText = strings.Join(links, "  ")
-	} else if len(detail.AuthorLogins) == 1 {
-		login := detail.AuthorLogins[0]
-		senderText = fmt.Sprintf("[%s](https://github.com/%s)", login, login)
-	}
+	senderText := buildSenderText(sender, senderUrl, detail.AuthorLogins)
 
 	// 收集最多 3 个头像的 img_key（飞书列数有上限，超出会导致排版混乱）
 	avatarsToDisplay := detail.AuthorAvatars
@@ -1305,56 +1804,52 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		}
 	}
 
-	// 删除事件：简洁单行 body，不显示冗余仓库/分支摘要
+	// 删除事件：简洁格式
 	if detail.IsDeleted {
-		tagIcon := "🗑️🌿"
+		tagIcon := "🌿"
+		linkPrefix := "/tree/"
 		if detail.IsTag {
-			tagIcon = "🗑️🏷️"
+			tagIcon = "🏷️"
+			linkPrefix = "/releases/tag/"
 		}
-		refLink := ""
-		if detail.RefName != "" && detail.RefURL != "" {
-			refLink = fmt.Sprintf(" [%s](%s)", detail.RefName, detail.RefURL)
-		} else if detail.RefName != "" {
-			refLink = fmt.Sprintf(" `%s`", detail.RefName)
+
+		// 摘要行：仓库名 / 头像 用户名
+		repoLine := ""
+		if repoUrl != "" {
+			repoLine = fmt.Sprintf("[%s](%s)", repo, repoUrl)
+		} else if repo != "" {
+			repoLine = repo
 		}
-		senderText := fmt.Sprintf("[%s](%s)", sender, senderUrl)
-		if len(detail.AuthorLogins) == 1 {
-			login := detail.AuthorLogins[0]
-			senderText = fmt.Sprintf("[%s](https://github.com/%s)", login, login)
-		}
-		content := fmt.Sprintf("%s%s 👤 %s", tagIcon, refLink, senderText)
-		if len(resolvedAvatars) > 0 {
-			avatarEls := make([]any, 0, len(resolvedAvatars))
-			for _, key := range resolvedAvatars {
-				avatarEls = append(avatarEls, map[string]any{
-					"tag":          "img",
-					"img_key":      key,
-					"custom_width": 20,
-					"mode":         "crop_center",
-					"alt":          map[string]string{"tag": "plain_text", "content": "avatar"},
-				})
-			}
-			card.Body.Elements = append(card.Body.Elements, map[string]any{
-				"tag":                "column_set",
-				"flex_mode":          "none",
-				"horizontal_spacing": "small",
-				"columns": []any{
-					map[string]any{
-						"tag": "column", "width": "weighted", "weight": 1,
-						"vertical_align": "center",
-						"elements":       []any{map[string]any{"tag": "markdown", "content": content}},
-					},
-					map[string]any{
-						"tag": "column", "width": "auto",
-						"vertical_align": "center",
-						"elements":       avatarEls,
-					},
-				},
-			})
+		if row := buildSummaryRow(repoLine, senderText, resolvedAvatars); row != nil {
+			card.Body.Elements = append(card.Body.Elements, row)
 		} else {
-			card.AddMarkdown(content)
+			card.AddMarkdown(repoLine + " / 👤 " + senderText)
 		}
-		// 删除事件也加 View Details 按钮
+
+		// 分支/标签列表
+		var refLines []string
+		if detail.RefName != "" {
+			if detail.RefURL != "" {
+				refLines = append(refLines, fmt.Sprintf("%s [%s](%s)", tagIcon, detail.RefName, detail.RefURL))
+			} else {
+				refLines = append(refLines, fmt.Sprintf("%s %s", tagIcon, detail.RefName))
+			}
+		} else if detail.Text != "" {
+			for _, line := range strings.Split(detail.Text, "\n") {
+				name := strings.TrimSpace(line)
+				if name == "" {
+					continue
+				}
+				if repoUrl != "" {
+					refLines = append(refLines, fmt.Sprintf("%s [%s](%s%s)", tagIcon, name, repoUrl, linkPrefix+name))
+				} else {
+					refLines = append(refLines, fmt.Sprintf("%s %s", tagIcon, name))
+				}
+			}
+		}
+		if len(refLines) > 0 {
+			card.AddMarkdown(strings.Join(refLines, "<br>"))
+		}
 		btnURL := repoUrl
 		if detail.URL != "" {
 			btnURL = detail.URL
@@ -1364,73 +1859,22 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		}
 	} else {
 
-	// 构建摘要行：用 column_set 排列 [meta文本] [头像...] [发送者]
-	// 头像全部合并进一个列（inline 排列），避免列数过多
-	if len(resolvedAvatars) > 0 {
-		// 将所有头像以小图标方式拼成一段 markdown（飞书 lark_md 不支持 img，
-		// 所以头像列仍用独立 img 元素，但合并到单个 column 的 elements 数组里）
-		avatarEls := make([]any, 0, len(resolvedAvatars))
-		for _, key := range resolvedAvatars {
-			avatarEls = append(avatarEls, map[string]any{
-				"tag":          "img",
-				"img_key":      key,
-				"custom_width": 20,
-				"mode":         "crop_center",
-				"alt": map[string]string{
-					"tag":     "plain_text",
-					"content": "avatar",
-				},
-			})
-		}
-
-		columns := []any{
-			// 左列：仓库+分支
-			map[string]any{
-				"tag":            "column",
-				"width":          "weighted",
-				"weight":         3,
-				"vertical_align": "center",
-				"elements": []any{
-					map[string]any{"tag": "markdown", "content": metaText},
-				},
-			},
-			// 中列：头像（多个 img 叠在同一列）
-			map[string]any{
-				"tag":            "column",
-				"width":          "auto",
-				"vertical_align": "center",
-				"elements":       avatarEls,
-			},
-			// 右列：发送者链接
-			map[string]any{
-				"tag":            "column",
-				"width":          "weighted",
-				"weight":         2,
-				"vertical_align": "center",
-				"elements": []any{
-					map[string]any{"tag": "markdown", "content": senderText},
-				},
-			},
-		}
-
-		card.Body.Elements = append(card.Body.Elements, map[string]any{
-			"tag":                "column_set",
-			"flex_mode":          "none",
-			"horizontal_spacing": "small",
-			"columns":            columns,
-		})
+	// 摘要行：仓库+分支 / 头像+用户名
+	if row := buildSummaryRow(metaText, senderText, resolvedAvatars); row != nil {
+		card.Body.Elements = append(card.Body.Elements, row)
 	} else {
-		// 无头像缓存时退回到纯文本摘要行
-		line := "👤 " + senderText
-		if metaText != "" {
-			line = metaText + " / " + line
+		line := metaText
+		if line != "" {
+			line += " / "
 		}
+		line += "👤 " + senderText
 		card.AddMarkdown(line)
 	}
 
 	// --- 2. 详情内容 ---
-	if detail.Text != "" {
-		card.AddDivider()
+	// 有结构化 CI 数据时跳过 detail.Text（避免 workflow 状态重复显示）
+	hasCI := len(detail.CIStatuses) > 0
+	if detail.Text != "" && !hasCI {
 		// Push 事件：超过 3 条 commit 时按 commit 折叠
 		commitCount := detail.CommitCount
 		if commitCount == 0 {
@@ -1438,8 +1882,8 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		}
 		if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
 			commits := splitCommits(detail.Text)
-			visible := strings.Join(commits[:3], "\n")
-			remaining := strings.Join(commits[3:], "\n")
+			visible := strings.Join(commits[:3], "<br>")
+			remaining := strings.Join(commits[3:], "<br>")
 			card.AddMarkdown(visible)
 			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
 		} else {
@@ -1449,7 +1893,6 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 
 	// --- 2.5 CI 状态（内联到触发事件的卡片）---
 	if ciText := renderCIStatuses(detail.CIStatuses, repoUrl); ciText != "" {
-		card.AddDivider()
 		card.AddMarkdown(ciText)
 	}
 
@@ -1459,42 +1902,43 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 	}
 
 	// --- 4. 操作按钮（V2 规范：必须放在 action 容器内）---
-	// CI 失败时优先显示 CI 操作按钮
 	var btns []ActionButton
 	if ciFailed(detail.CIStatuses) {
+		// CI 失败时只显示 CI 专用按钮，不追加通用 View Details（URL 重复）
 		btns = makeCIActionButtons(detail.CIStatuses, repoUrl)
-	}
-	// Push / 删除 / 新建分支等事件不显示详情按钮
-	skipBtn := strings.Contains(detail.Title, "commits") ||
-		strings.Contains(detail.Title, "Deleted") ||
-		strings.Contains(detail.Title, "Created")
-	if detail.URL != "" && !skipBtn {
-		btnType := "primary"
-		if ciFailed(detail.CIStatuses) || ContainsAny(detail.Title, "❌", "💥") {
-			btnType = "danger"
+	} else {
+		// 非 CI 失败：Push / 删除 / 新建分支等事件不显示详情按钮
+		skipBtn := strings.Contains(detail.Title, "commits") ||
+			strings.Contains(detail.Title, "Deleted") ||
+			strings.Contains(detail.Title, "Created")
+		if detail.URL != "" && !skipBtn {
+			btnType := "primary"
+			if ContainsAny(detail.Title, "❌", "💥") {
+				btnType = "danger"
+			}
+			btns = append(btns, ActionButton{Text: "View Details", URL: detail.URL, Type: btnType})
 		}
-		btns = append(btns, ActionButton{Text: "View Details", URL: detail.URL, Type: btnType})
 	}
 	if len(btns) > 0 {
 		card.AddActions("flow", btns...)
 	}
 	} // end of non-delete rendering
 
-	// --- 5. 事件发生时间 ---
+	// --- 5. 事件发生时间（用飞书 <local_datetime> 自动适配用户时区）---
+	// format_type 枚举: date_num(2026/6/3) date_short(6月3日) date(2026年6月3日)
+	//   week/week_short(星期三/周三) time(14:05) time_sec(14:05:09) timezone(14:05:09 GMT+8)
 	if detail.EventTime != "" {
 		if t, err := time.Parse(time.RFC3339, detail.EventTime); err == nil {
-			loc, err := time.LoadLocation("Asia/Shanghai")
-			if err != nil {
-				loc = time.UTC
-			}
-			timeStr := t.In(loc).Format("2006-01-02 15:04:05")
+			ms := t.UnixMilli()
+			timeTag := fmt.Sprintf(`<local_datetime millisecond="%d" format_type="date"></local_datetime> <local_datetime millisecond="%d" format_type="time_sec"></local_datetime>`, ms, ms)
 			// 合并事件显示时间范围
 			if detail.EventTimeEnd != "" {
 				if t2, err2 := time.Parse(time.RFC3339, detail.EventTimeEnd); err2 == nil {
-					timeStr += " ~ " + t2.In(loc).Format("15:04:05")
+					ms2 := t2.UnixMilli()
+					timeTag += " ~ " + fmt.Sprintf(`<local_datetime millisecond="%d" format_type="time_sec"></local_datetime>`, ms2)
 				}
 			}
-			card.AddMarkdown(fmt.Sprintf("🕐 %s", timeStr))
+			card.AddMarkdown(fmt.Sprintf("🕐 %s", timeTag))
 		}
 	}
 

@@ -88,13 +88,14 @@ func getThreadReplyWindow() time.Duration {
 }
 
 // mergeSearch 定义查找已有消息记录的搜索条件
-// githubID 和 githubIDLike 为 OR 关系，eventType / withinWindow / recordType 为 AND 关系
+// githubID / githubIDLike / githubIDLikes 为 OR 关系，eventType / withinWindow / recordType 为 AND 关系
 type mergeSearch struct {
-	githubID     string // github_id 精确匹配
-	githubIDLike string // github_id LIKE 模式匹配
-	eventType    string // event_type 精确匹配（空值表示不筛选）
-	recordType   string // record_type 精确匹配（空值表示不筛选）
-	withinWindow bool   // 是否应用合并窗口时间过滤
+	githubID      string   // github_id 精确匹配
+	githubIDLike  string   // github_id LIKE 模式匹配（单个）
+	githubIDLikes []string // github_id LIKE 模式匹配（多个，OR 关系）
+	eventType     string   // event_type 精确匹配（空值表示不筛选）
+	recordType    string   // record_type 精确匹配（空值表示不筛选）
+	withinWindow  bool     // 是否应用合并窗口时间过滤
 }
 
 // tryMergeWithExisting 尝试查找已有消息记录并合并/更新
@@ -113,12 +114,23 @@ func tryMergeWithExisting(
 	var record MessageRecord
 	q := DB.NewSelect().Model(&record)
 
-	if search.githubID != "" && search.githubIDLike != "" {
-		q = q.Where("github_id = ? OR github_id LIKE ?", search.githubID, search.githubIDLike)
-	} else if search.githubID != "" {
-		q = q.Where("github_id = ?", search.githubID)
-	} else if search.githubIDLike != "" {
-		q = q.Where("github_id LIKE ?", search.githubIDLike)
+	// 构建 github_id 的 OR 条件
+	var idClauses []string
+	var idArgs []any
+	if search.githubID != "" {
+		idClauses = append(idClauses, "github_id = ?")
+		idArgs = append(idArgs, search.githubID)
+	}
+	if search.githubIDLike != "" {
+		idClauses = append(idClauses, "github_id LIKE ?")
+		idArgs = append(idArgs, search.githubIDLike)
+	}
+	for _, like := range search.githubIDLikes {
+		idClauses = append(idClauses, "github_id LIKE ?")
+		idArgs = append(idArgs, like)
+	}
+	if len(idClauses) > 0 {
+		q = q.Where(strings.Join(idClauses, " OR "), idArgs...)
 	}
 	if search.eventType != "" {
 		q = q.Where("event_type = ?", search.eventType)
@@ -162,6 +174,26 @@ func tryMergeWithExisting(
 
 	slog.Info(logMsg, "github_id", record.GithubID)
 	return true, nil
+}
+
+// tryDedup 尝试去重：如果合并窗口内已有相同 githubID + eventType 的记录，
+// 静默更新内容并跳过发送新消息。返回 true 表示已去重（调用方应立即返回）。
+func tryDedup(ctx context.Context, githubID, eventType string, detail *EventDetail) bool {
+	var record MessageRecord
+	if err := DB.NewSelect().Model(&record).
+		Where("github_id = ?", githubID).
+		Where("event_type = ?", eventType).
+		Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
+		Order("id DESC").Limit(1).Scan(ctx); err != nil {
+		return false
+	}
+	detailJson, _ := json.Marshal(detail)
+	_, _ = DB.NewUpdate().Model(&record).
+		Set("content = ?", string(detailJson)).
+		Set("updated_at = ?", time.Now()).
+		WherePK().Exec(ctx)
+	slog.Info("Event deduplicated", "github_id", githubID, "event_type", eventType)
+	return true
 }
 
 // extractCIStatus 从 CI 事件负载中提取 status 和 conclusion
@@ -362,6 +394,22 @@ func processWebhookEvent(event WebhookEvent) error {
 		return fmt.Errorf("failed to parse Webhook: %w", err)
 	}
 
+	// 跳过不需要通知的管理员/基础设施事件
+	adminEvents := map[string]bool{
+		"ping": true, "meta": true, "installation": true,
+		"installation_repositories": true, "installation_target": true,
+		"github_app_authorization": true, "marketplace_purchase": true,
+		"registry_package": true, "content_reference": true,
+		"personal_access_token_request": true, "custom_property": true,
+		"custom_property_values": true, "repository_import": true,
+		"security_and_analysis": true, "secret_scanning_alert_location": true,
+		"deployment_protection_rule": true, "deployment_review": true,
+		"user": true, "org_block": true, "sponsorship": true,
+	}
+	if adminEvents[event.EventType] {
+		return nil
+	}
+
 	detail := ParseEvent(githubEvent, event.EventType)
 	if detail.EventTime == "" && !event.CreatedAt.IsZero() {
 		detail.EventTime = event.CreatedAt.Format(time.RFC3339)
@@ -485,6 +533,42 @@ func processWebhookEvent(event WebhookEvent) error {
 		githubID = fmt.Sprintf("prcomment:%s:%s", repo, ext(m, "pull_request", "number"))
 	case "pull_request_review":
 		githubID = fmt.Sprintf("prreview:%s:%s", repo, ext(m, "pull_request", "number"))
+	case "commit_comment":
+		githubID = fmt.Sprintf("commit_comment:%s:%s", repo, ext(m, "comment", "id"))
+	case "deployment":
+		githubID = fmt.Sprintf("deployment:%s:%s", repo, ext(m, "deployment", "id"))
+	case "deployment_status":
+		githubID = fmt.Sprintf("deployment:%s:%s", repo, ext(m, "deployment", "id"))
+	case "discussion":
+		githubID = fmt.Sprintf("discussion:%s:%s", repo, ext(m, "discussion", "number"))
+	case "discussion_comment":
+		githubID = fmt.Sprintf("discussion:%s:%s", repo, ext(m, "discussion", "number"))
+	case "label":
+		githubID = fmt.Sprintf("label:%s:%s", repo, ext(m, "label", "id"))
+	case "milestone":
+		githubID = fmt.Sprintf("milestone:%s:%s", repo, ext(m, "milestone", "number"))
+	case "pull_request_review_thread":
+		githubID = fmt.Sprintf("prthread:%s:%s", repo, ext(m, "pull_request", "number"))
+	case "status":
+		githubID = fmt.Sprintf("status:%s:%s:%s", repo, ext(m, "sha"), ext(m, "context"))
+	case "branch_protection_rule":
+		githubID = fmt.Sprintf("bprule:%s:%s", repo, ext(m, "rule", "id"))
+	case "repository_ruleset":
+		githubID = fmt.Sprintf("ruleset:%s:%s", repo, ext(m, "repository_ruleset", "id"))
+	case "code_scanning_alert":
+		githubID = fmt.Sprintf("codescan:%s:%s", repo, ext(m, "alert", "number"))
+	case "dependabot_alert":
+		githubID = fmt.Sprintf("dependabot:%s:%s", repo, ext(m, "alert", "number"))
+	case "secret_scanning_alert":
+		githubID = fmt.Sprintf("secretscan:%s:%s", repo, ext(m, "alert", "number"))
+	case "repository_vulnerability_alert":
+		githubID = fmt.Sprintf("vulnalert:%s:%s", repo, ext(m, "alert", "id"))
+	case "security_advisory":
+		githubID = fmt.Sprintf("advisory:%s:%s", repo, ext(m, "security_advisory", "ghsa_id"))
+	case "team_add":
+		githubID = fmt.Sprintf("team_add:%s:%s", repo, ext(m, "team", "id"))
+	case "page_build":
+		githubID = fmt.Sprintf("page_build:%s", repo)
 	default:
 		githubID = sha
 		if githubID == "" {
@@ -492,6 +576,32 @@ func processWebhookEvent(event WebhookEvent) error {
 			if issueNum != "" {
 				githubID = fmt.Sprintf("issue:%s:%s", repo, issueNum)
 			}
+		}
+	}
+
+	// 3.5 跳过非 "created"/"submitted" 的评论/Review 事件（避免 edited/deleted 通知噪音）
+	if event.EventType == "issue_comment" && ext(m, "action") != "created" {
+		return nil
+	}
+	if event.EventType == "pull_request_review_comment" && ext(m, "action") != "created" {
+		return nil
+	}
+	if event.EventType == "pull_request_review" && ext(m, "action") != "submitted" {
+		return nil
+	}
+
+	// 3.6 通用去重：合并窗口内同一 githubID + eventType 的事件只保留一次
+	// 跳过已有专门合并逻辑的事件（push, create, delete, issue_comment/PR comment 的 created）
+	needDedup := githubID != "" &&
+		event.EventType != "push" &&
+		event.EventType != "create" &&
+		event.EventType != "delete" &&
+		event.EventType != "issue_comment" &&
+		event.EventType != "pull_request_review_comment"
+
+	if needDedup {
+		if tryDedup(ctx, githubID, event.EventType, &detail) {
+			return nil
 		}
 	}
 
@@ -653,6 +763,30 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
+	// 4.2a Deployment 事件：更新同一个 deployment 的消息（状态变更等）
+	if event.EventType == "deployment" && githubID != "" {
+		merged, err := tryMergeWithExisting(ctx,
+			mergeSearch{githubID: githubID, eventType: "deployment"},
+			func(_, new *EventDetail) {}, // Deployment 直接替换
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"Deployment card updated",
+		)
+		if merged {
+			return err
+		}
+	}
+	if event.EventType == "deployment_status" && githubID != "" {
+		merged, err := tryMergeWithExisting(ctx,
+			mergeSearch{githubID: githubID, withinWindow: true},
+			func(_, new *EventDetail) {}, // 状态直接替换
+			"", &detail, repo, repoUrl, sender, senderUrl, avatarUrl,
+			"Deployment status updated",
+		)
+		if merged {
+			return err
+		}
+	}
+
 	// 4.3 分支推送合并：同一分支在合并窗口内的连续推送合并为一条（排除分支删除）
 	if event.EventType == "push" && githubID != "" && !detail.IsTag && !detail.IsDeleted && detail.Text != "" {
 		detail.EventCount = len(strings.Split(detail.Text, "\n"))
@@ -682,10 +816,17 @@ func processWebhookEvent(event WebhookEvent) error {
 		return nil
 	}
 
-	// 4.3b 分支删除合并：同一仓库在合并窗口内的分支删除合并为一条
+	// 4.3b 分支删除合并：同一仓库在合并窗口内的分支删除合并为一条（同时匹配 push 和 delete 事件）
 	if event.EventType == "push" && detail.IsDeleted && !detail.IsTag {
 		merged, err := tryMergeWithExisting(ctx,
-			mergeSearch{githubIDLike: fmt.Sprintf("push:%s:refs/heads/%%", repo), recordType: "deleted", withinWindow: true},
+			mergeSearch{
+				githubIDLikes: []string{
+					fmt.Sprintf("push:%s:refs/heads/%%", repo),
+					fmt.Sprintf("delete:%s:branch:%%", repo),
+				},
+				recordType:   "deleted",
+				withinWindow: true,
+			},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
 					new.Text = old.Text + "\n" + new.Text
@@ -732,10 +873,17 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
-	// 4.4a 分支删除合并：同一仓库在合并窗口内的分支删除合并（delete 事件）
+	// 4.4a 分支删除合并：同一仓库在合并窗口内的分支删除合并（同时匹配 push 和 delete 事件）
 	if event.EventType == "delete" && detail.IsDeleted && !detail.IsTag {
 		merged, err := tryMergeWithExisting(ctx,
-			mergeSearch{githubIDLike: fmt.Sprintf("delete:%s:branch:%%", repo), withinWindow: true},
+			mergeSearch{
+				githubIDLikes: []string{
+					fmt.Sprintf("delete:%s:branch:%%", repo),
+					fmt.Sprintf("push:%s:refs/heads/%%", repo),
+				},
+				recordType:   "deleted",
+				withinWindow: true,
+			},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
 					new.Text = old.Text + "\n" + new.Text
@@ -1055,14 +1203,17 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// 5. 查找父级 ID (回复逻辑)
-	// 改为：只要是 Issue/PR 相关的非"创建"事件，都尝试寻找父消息进行话题回复
+	// 改为：只要是 Issue/PR/Discussion 相关的非"创建"事件，都尝试寻找父消息进行话题回复
 	// 注意：CI 事件不在这里处理，它们的父消息已在 4.6 通过 head_sha 精确关联
 	// 注意：评论合并（4.5a）在本步骤之前执行，已合并的评论不会进入本逻辑
 	isInteraction := event.EventType == "issue_comment" ||
 		event.EventType == "pull_request_review_comment" ||
 		event.EventType == "pull_request_review" ||
+		event.EventType == "pull_request_review_thread" ||
 		event.EventType == "pull_request" ||
-		event.EventType == "issues"
+		event.EventType == "issues" ||
+		event.EventType == "discussion_comment" ||
+		event.EventType == "commit_comment"
 
 	action := ext(m, "action")
 	if isInteraction && action != "opened" {
@@ -1079,6 +1230,20 @@ func processWebhookEvent(event WebhookEvent) error {
 				parentID = shaRecord.FeishuMessageID
 			}
 		}
+		// Discussion 评论：查找父 Discussion 消息
+		if parentID == "" && event.EventType == "discussion_comment" {
+			discNum := ext(m, "discussion", "number")
+			if discNum != "" {
+				var discRecord MessageRecord
+				if err := DB.NewSelect().Model(&discRecord).
+					Where("github_id = ?", fmt.Sprintf("discussion:%s:%s", repo, discNum)).
+					Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
+					Order("id ASC").Limit(1).Scan(ctx); err == nil {
+					parentID = discRecord.FeishuMessageID
+				}
+			}
+		}
+		// Issue/PR 评论和 Review：查找父 Issue/PR 消息
 		if parentID == "" {
 			issueNum := ext(m, "issue", "number")
 			if issueNum == "" {
@@ -1090,7 +1255,7 @@ func processWebhookEvent(event WebhookEvent) error {
 				if strings.Contains(githubID, "pr:") || strings.Contains(githubID, "issue:") {
 					searchID = fmt.Sprintf("%%:%s:%s", repo, issueNum)
 				}
-				if strings.Contains(githubID, "comment:") || strings.Contains(githubID, "prcomment:") || strings.Contains(githubID, "prreview:") {
+				if strings.Contains(githubID, "comment:") || strings.Contains(githubID, "prcomment:") || strings.Contains(githubID, "prreview:") || strings.Contains(githubID, "prthread:") {
 					searchID = fmt.Sprintf("%%:%s:%s", repo, issueNum)
 				}
 
@@ -1100,6 +1265,22 @@ func processWebhookEvent(event WebhookEvent) error {
 					Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
 					Order("id ASC").Limit(1).Scan(ctx); err == nil {
 					parentID = record.FeishuMessageID
+				}
+			}
+		}
+		// Commit Comment：通过 SHA 关联到 push 消息（如果还没找到）
+		if parentID == "" && event.EventType == "commit_comment" && sha == "" {
+			commitSHA := ext(m, "comment", "commit_id")
+			if commitSHA != "" {
+				var shaRecord MessageRecord
+				if err := DB.NewSelect().Model(&shaRecord).
+					Where("repo_name = ?", repo).
+					Where("event_type = ?", "push").
+					Where("head_sha = ?", commitSHA).
+					Where("record_type != 'deleted'").
+					Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
+					Order("id ASC").Limit(1).Scan(ctx); err == nil {
+					parentID = shaRecord.FeishuMessageID
 				}
 			}
 		}

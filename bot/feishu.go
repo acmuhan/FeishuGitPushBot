@@ -307,16 +307,28 @@ func (c *Card) String() string {
 // 卡片 Body 元素构造方法
 // ---------------------------------------------------------------------------
 
-// AddDivider 添加分割线
+// AddDivider 添加分割线（紧凑间距）
 func (c *Card) AddDivider() {
-	c.Body.Elements = append(c.Body.Elements, map[string]string{"tag": "hr"})
+	c.Body.Elements = append(c.Body.Elements, map[string]any{
+		"tag":    "hr",
+		"margin": "4px 0px",
+	})
 }
 
-// AddMarkdown 添加 lark_md Markdown 块
+// AddMarkdown 添加 Markdown 块
 func (c *Card) AddMarkdown(content string) {
 	c.Body.Elements = append(c.Body.Elements, map[string]any{
 		"tag":     "markdown",
 		"content": content,
+	})
+}
+
+// AddMarkdownWithSize 添加指定字号的 Markdown 块
+func (c *Card) AddMarkdownWithSize(content string, size string) {
+	c.Body.Elements = append(c.Body.Elements, map[string]any{
+		"tag":       "markdown",
+		"content":   content,
+		"text_size": size,
 	})
 }
 
@@ -379,20 +391,23 @@ func (c *Card) AddActions(layout string, buttons ...ActionButton) {
 }
 
 // ToMap 将 ActionButton 转换为 V2 规范的 button 组件 map
+// 参考: https://open.feishu.cn/document/feishu-cards/card-json-v2-components/interactive-components/button
 func (b *ActionButton) ToMap(index int) map[string]any {
 	btn := map[string]any{
 		"tag":        "button",
-		"element_id": fmt.Sprintf("btn_%d_%d", time.Now().Unix(), index),
+		"element_id": fmt.Sprintf("btn_%s_%d", b.Type, index),
 		"text":       map[string]string{"tag": "plain_text", "content": b.Text},
 		"type":       b.Type,
+		"size":       "small",
 	}
 	if b.URL != "" {
-		btn["multi_url"] = map[string]any{
-			"url":         b.URL,
-			"pc_url":      "",
-			"android_url": "",
-			"ios_url":     "",
+		btn["behaviors"] = []any{
+			map[string]any{
+				"type":        "open_url",
+				"default_url": b.URL,
+			},
 		}
+		btn["hover_tips"] = map[string]string{"tag": "plain_text", "content": b.URL}
 	}
 	if b.Disabled {
 		btn["disabled"] = true
@@ -409,22 +424,15 @@ type ActionButton struct {
 	Disabled bool
 }
 
-// AddNote 添加备注（V2 规范：note 组件，elements 内可含 img / plain_text / lark_md）
-func (c *Card) AddNote(elements ...any) {
-	if len(elements) == 0 {
+// AddNote 添加备注（V2 规范用 notation 字号的 markdown 组件模拟备注效果）
+func (c *Card) AddNote(content string) {
+	if content == "" {
 		return
 	}
 	c.Body.Elements = append(c.Body.Elements, map[string]any{
-		"tag":      "note",
-		"elements": elements,
-	})
-}
-
-// AddNoteText 添加纯文本备注（快捷方法）
-func (c *Card) AddNoteText(content string) {
-	c.AddNote(map[string]any{
-		"tag":     "lark_md",
-		"content": content,
+		"tag":       "markdown",
+		"content":   content,
+		"text_size": "notation",
 	})
 }
 

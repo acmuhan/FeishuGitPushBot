@@ -25,7 +25,7 @@ type Config struct {
 		URL string `koanf:"url"`
 	} `koanf:"database"`
 	Events struct {
-		MergeWindow       int `koanf:"merge_window"`        // 同类事件合并窗口（分钟），默认 10
+		MergeWindow       int `koanf:"merge_window"`        // 同类事件合并窗口（分钟），默认 15
 		ThreadReplyWindow int `koanf:"thread_reply_window"` // 话题回复窗口（分钟），超过此时间的父消息不再以话题回复，默认 60
 	} `koanf:"events"`
 	Security struct {
@@ -90,7 +90,7 @@ func LoadConfig() {
 		slog.Warn("DATABASE_URL is not set, message records will not be saved for updates or replies")
 	}
 	if C.Events.MergeWindow == 0 {
-		C.Events.MergeWindow = 10 // 默认 10 分钟
+		C.Events.MergeWindow = 15 // 默认 15 分钟
 	}
 	if C.Events.ThreadReplyWindow == 0 {
 		C.Events.ThreadReplyWindow = 60 // 默认 60 分钟
