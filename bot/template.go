@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -57,6 +58,8 @@ type CIStatus struct {
 	JobName     string `json:"job_name,omitempty"`      // job 名称（用于显示）
 	ParentRunID int64  `json:"parent_run_id,omitempty"` // 关联的 workflow run ID
 }
+
+const pushGroupSeparator = "\n---\n"
 
 // ParseEvent 解析 GitHub 事件为极简明了的 Detail
 func ParseEvent(event any, eventType string) EventDetail {
@@ -433,6 +436,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			return d
 		}
 		status := wr.GetStatus()
+		if status == "" {
+			status = e.GetAction()
+		}
 		conclusion := wr.GetConclusion()
 		workflowName := wr.GetName()
 		ref := wr.GetHeadBranch()
@@ -442,25 +448,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 			shortSHA = sha[:7]
 		}
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			if conclusion == "failure" {
-				stateVerb = "failed"
-			} else {
-				stateVerb = conclusion
-			}
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.SHA = shortSHA
 		d.FullSHA = sha
@@ -518,21 +506,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.SHA = shortSHA
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			stateVerb = conclusion
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.Title = fmt.Sprintf("%s Job %s: %s", icon, titleCase(stateVerb), jobName)
 
@@ -586,21 +560,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.SHA = shortSHA
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			stateVerb = conclusion
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.Title = fmt.Sprintf("%s Check: %s", icon, name)
 		d.Text = fmt.Sprintf("%s check **%s** %s", icon, name, stateVerb)
@@ -622,21 +582,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.SHA = shortSHA
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			stateVerb = conclusion
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.Title = fmt.Sprintf("%s Check Suite %s", icon, titleCase(stateVerb))
 		d.Text = fmt.Sprintf("%s check suite %s", icon, stateVerb)
@@ -1381,6 +1327,58 @@ func splitCommits(text string) []string {
 	return commits
 }
 
+func splitPushTextGroups(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "<br>---<br>", pushGroupSeparator)
+	parts := strings.Split(text, pushGroupSeparator)
+	var groups []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			groups = append(groups, part)
+		}
+	}
+	return groups
+}
+
+func addPushMarkdown(card *Card, detail EventDetail) {
+	addGroup := func(text string) {
+		commits := splitCommits(text)
+		if len(commits) > 3 {
+			visible := strings.Join(commits[:3], "<br>")
+			remaining := strings.Join(commits[3:], "<br>")
+			card.AddMarkdown(visible)
+			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
+			return
+		}
+		card.AddMarkdown(text)
+	}
+
+	groups := splitPushTextGroups(detail.Text)
+	if len(groups) > 1 {
+		for i, group := range groups {
+			if i > 0 {
+				card.AddDivider()
+			}
+			addGroup(group)
+		}
+		return
+	}
+
+	commitCount := detail.CommitCount
+	if commitCount == 0 {
+		commitCount = detail.EventCount
+	}
+	if commitCount > 3 {
+		commits := splitCommits(detail.Text)
+		if len(commits) > 3 {
+			addGroup(detail.Text)
+			return
+		}
+	}
+	card.AddMarkdown(detail.Text)
+}
+
 // titleCase 将字符串首字母大写（替代已废弃的 strings.Title）
 func titleCase(s string) string {
 	if s == "" {
@@ -1562,30 +1560,27 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 		jobs     []CIStatus
 	}
 	var groups []workflowGroup
-	workflowMap := make(map[string]*workflowGroup)
+	jobsByRun := make(map[string][]CIStatus)
 
 	for _, cs := range statuses {
 		if strings.HasPrefix(cs.WorkflowName, "job:") {
-			// job 条目：提取 parent_run_id 关联到 workflow
 			if cs.ParentRunID > 0 {
 				key := fmt.Sprintf("%d", cs.ParentRunID)
-				if g, ok := workflowMap[key]; ok {
-					g.jobs = append(g.jobs, cs)
-				}
+				jobsByRun[key] = upsertRenderedCIStatus(jobsByRun[key], cs)
 			}
 		} else {
 			// workflow 条目
-			key := fmt.Sprintf("%d", cs.RunID)
 			g := workflowGroup{workflow: cs}
-			workflowMap[key] = &g
 			groups = append(groups, g)
 		}
 	}
+	attachedJobRuns := make(map[string]bool)
 	// 更新 groups 中的 jobs
 	for i := range groups {
 		key := fmt.Sprintf("%d", groups[i].workflow.RunID)
-		if g, ok := workflowMap[key]; ok {
-			groups[i].jobs = g.jobs
+		if jobs, ok := jobsByRun[key]; ok {
+			groups[i].jobs = jobs
+			attachedJobRuns[key] = true
 		}
 	}
 
@@ -1596,30 +1591,109 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 			lines = append(lines, renderSingleCIStatus(job, repoURL, true))
 		}
 	}
+	var unattachedRunKeys []string
+	for runKey := range jobsByRun {
+		if !attachedJobRuns[runKey] {
+			unattachedRunKeys = append(unattachedRunKeys, runKey)
+		}
+	}
+	sort.Strings(unattachedRunKeys)
+	for _, runKey := range unattachedRunKeys {
+		for _, job := range jobsByRun[runKey] {
+			lines = append(lines, renderSingleCIStatus(job, repoURL, false))
+		}
+	}
 	return strings.Join(lines, "<br>")
+}
+
+func upsertRenderedCIStatus(statuses []CIStatus, status CIStatus) []CIStatus {
+	key := status.WorkflowName
+	for i, existing := range statuses {
+		if existing.WorkflowName == key {
+			statuses[i] = status
+			return statuses
+		}
+	}
+	return append(statuses, status)
+}
+
+func cleanCIStatusDisplayName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "✅ ")
+	name = strings.TrimPrefix(name, "❌ ")
+	name = strings.TrimPrefix(name, "⏳ ")
+	name = strings.TrimPrefix(name, "⚙️ ")
+	name = strings.TrimPrefix(name, "🚫 ")
+	for _, prefix := range []string{
+		"Workflow Succeeded: ",
+		"Workflow Failed: ",
+		"Workflow Running: ",
+		"Workflow Started: ",
+		"Workflow Requested: ",
+		"Workflow Queued: ",
+		"Workflow Waiting: ",
+		"Workflow Completed: ",
+		"Workflow Cancelled: ",
+		"Workflow Timed_out: ",
+		"Workflow Timed Out: ",
+		"Workflow Neutral: ",
+		"Workflow Skipped: ",
+		"Workflow Action_required: ",
+		"Workflow Action Required: ",
+	} {
+		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
+			return strings.TrimSpace(name[len(prefix):])
+		}
+	}
+	return name
+}
+
+func ciStateDisplay(status, conclusion string) (string, string) {
+	switch conclusion {
+	case "success":
+		return "✅", "succeeded"
+	case "failure":
+		return "❌", "failed"
+	case "cancelled":
+		return "🚫", "cancelled"
+	case "timed_out":
+		return "❌", "timed out"
+	case "skipped":
+		return "⏭️", "skipped"
+	case "neutral":
+		return "➖", "neutral"
+	case "action_required":
+		return "⚠️", "action required"
+	}
+	if conclusion != "" {
+		return "⚠️", strings.ReplaceAll(conclusion, "_", " ")
+	}
+	switch status {
+	case "requested":
+		return "⚙️", "requested"
+	case "queued":
+		return "🕒", "queued"
+	case "waiting":
+		return "🕒", "waiting"
+	case "pending":
+		return "🕒", "pending"
+	case "in_progress":
+		return "⏳", "running"
+	case "completed":
+		return "✅", "completed"
+	default:
+		if status != "" {
+			return "⚙️", status
+		}
+		return "⚙️", "started"
+	}
 }
 
 // renderSingleCIStatus 渲染单条 CI 状态
 func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
-	icon := "⏳"
-	statusText := cs.Status
-	switch cs.Conclusion {
-	case "success":
-		icon = "✅"
+	icon, statusText := ciStateDisplay(cs.Status, cs.Conclusion)
+	if cs.Conclusion == "success" {
 		statusText = "passed"
-	case "failure":
-		icon = "❌"
-		statusText = "failed"
-	case "cancelled":
-		icon = "🚫"
-		statusText = "cancelled"
-	default:
-		if cs.Status == "in_progress" {
-			statusText = "running"
-		} else if cs.Status == "queued" || cs.Status == "waiting" {
-			icon = "⏳"
-			statusText = "pending"
-		}
 	}
 	durationPart := ""
 	if cs.Duration != "" {
@@ -1635,9 +1709,10 @@ func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
 	if strings.HasPrefix(displayName, "job:") {
 		displayName = cs.JobName // 使用存储的 job 名称
 	}
+	displayName = cleanCIStatusDisplayName(displayName)
 
 	if isJob {
-		return fmt.Sprintf("    %s %s **%s**%s", icon, displayName, statusText, durationPart)
+		return fmt.Sprintf("↳ %s %s **%s**%s", icon, displayName, statusText, durationPart)
 	}
 	return fmt.Sprintf("%s %s **%s**%s%s", icon, displayName, statusText, durationPart, runLink)
 }
@@ -1645,11 +1720,20 @@ func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
 // ciFailed 检查 CI 状态列表中是否有失败的
 func ciFailed(statuses []CIStatus) bool {
 	for _, cs := range statuses {
-		if cs.Conclusion == "failure" || cs.Conclusion == "cancelled" {
+		if ciConclusionNeedsAttention(cs.Conclusion) {
 			return true
 		}
 	}
 	return false
+}
+
+func ciConclusionNeedsAttention(conclusion string) bool {
+	switch conclusion {
+	case "failure", "cancelled", "timed_out", "startup_failure", "action_required":
+		return true
+	default:
+		return false
+	}
 }
 
 // makeCIActionButtons 为失败的 CI 事件生成操作按钮
@@ -1660,7 +1744,7 @@ func makeCIActionButtons(statuses []CIStatus, repoURL string) []ActionButton {
 	var btns []ActionButton
 	seenRuns := make(map[int64]bool)
 	for _, cs := range statuses {
-		if (cs.Conclusion == "failure" || cs.Conclusion == "cancelled") && cs.RunID > 0 && !seenRuns[cs.RunID] {
+		if ciConclusionNeedsAttention(cs.Conclusion) && cs.RunID > 0 && !seenRuns[cs.RunID] {
 			seenRuns[cs.RunID] = true
 			btns = append(btns, ActionButton{
 				Text: fmt.Sprintf("View %s Logs", cs.WorkflowName),
@@ -1896,17 +1980,8 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		// 有结构化 CI 数据时跳过 detail.Text（避免 workflow 状态重复显示）
 		hasCI := len(detail.CIStatuses) > 0
 		if detail.Text != "" && !hasCI {
-			// Push 事件：超过 3 条 commit 时按 commit 折叠
-			commitCount := detail.CommitCount
-			if commitCount == 0 {
-				commitCount = detail.EventCount
-			}
-			if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
-				commits := splitCommits(detail.Text)
-				visible := strings.Join(commits[:3], "<br>")
-				remaining := strings.Join(commits[3:], "<br>")
-				card.AddMarkdown(visible)
-				card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
+			if detail.Action == "push" && !detail.IsDeleted {
+				addPushMarkdown(card, detail)
 			} else {
 				card.AddMarkdown(detail.Text)
 			}
@@ -2139,18 +2214,18 @@ func containsMarkdownList(s string) bool {
 	return markdownListRe.MatchString(s)
 }
 
-// ProcessCommitMessage 处理提交信息，转换 emoji、高亮 Conventional Commit 前缀，并转换 SHA/Issue 为链接
+// ProcessCommitMessage 处理提交信息，转换 emoji、规范 Conventional Commit 前缀空格，并转换 SHA/Issue 为链接
 func ProcessCommitMessage(msg string, repoUrl string) string {
 	msg = strings.TrimSpace(msg)
 	// 1. 转换 Emoji 短代码
 	msg = emoji.Sprint(msg)
 
-	// 2. 转换 SHA 和 #Issue (在加粗前处理，避免 Markdown 嵌套冲突)
+	// 2. 转换 SHA 和 #Issue
 	if repoUrl != "" {
 		msg = Linkify(msg, repoUrl)
 	}
 
-	// 3. 高亮 Conventional Commit 并处理格式
+	// 3. 规范 Conventional Commit 前缀后的空格
 	matches := conventionalRegex.FindAllStringIndex(msg, -1)
 	if len(matches) == 0 {
 		return msg
@@ -2167,10 +2242,8 @@ func ProcessCommitMessage(msg string, repoUrl string) string {
 			result.WriteString(part)
 		}
 
-		// 加粗匹配的前缀
-		result.WriteString("**")
+		// 保持提交行普通字号，避免飞书将第一条 commit 渲染得过重。
 		result.WriteString(msg[start:end])
-		result.WriteString("**")
 
 		// 确保 prefix 后面有一个空格（解决 feat:xxxx 无法高亮的问题）
 		if end < len(msg) && msg[end] != ' ' && msg[end] != '\n' && msg[end] != '\t' {

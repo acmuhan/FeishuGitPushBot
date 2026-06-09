@@ -200,7 +200,11 @@ func tryDedup(ctx context.Context, githubID, eventType string, detail *EventDeta
 func extractCIStatus(m map[string]any, eventType string) (status, conclusion string) {
 	switch eventType {
 	case "workflow_run":
-		return ext(m, "workflow_run", "status"), ext(m, "workflow_run", "conclusion")
+		status = ext(m, "workflow_run", "status")
+		if status == "" {
+			status = ext(m, "action")
+		}
+		return status, ext(m, "workflow_run", "conclusion")
 	case "workflow_job":
 		return ext(m, "workflow_job", "status"), ext(m, "workflow_job", "conclusion")
 	case "check_run":
@@ -299,9 +303,23 @@ func applyWorkflowTriggeringActor(m map[string]any, sender, senderUrl, avatarUrl
 	return login, senderUrl, avatarUrl
 }
 
+func workflowRunDisplayName(m map[string]any, fallback string) string {
+	name := ext(m, "workflow_run", "name")
+	if name == "" {
+		name = cleanCIStatusDisplayName(fallback)
+	}
+	if name == "" {
+		name = "Workflow"
+	}
+	if attempt := workflowRunAttempt(m); attempt > 1 {
+		name = fmt.Sprintf("%s (attempt #%d)", name, attempt)
+	}
+	return name
+}
+
 func setCIStatusForWorkflowRun(m map[string]any, detail *EventDetail, status, conclusion, ref string) {
 	ciStatus := CIStatus{
-		WorkflowName: detail.Title,
+		WorkflowName: workflowRunDisplayName(m, detail.Title),
 		Status:       status,
 		Conclusion:   conclusion,
 		Ref:          ref,
@@ -314,6 +332,49 @@ func setCIStatusForWorkflowRun(m map[string]any, detail *EventDetail, status, co
 	detail.CIStatuses = []CIStatus{ciStatus}
 }
 
+func workflowJobStatus(m map[string]any, detail EventDetail, ref string) CIStatus {
+	status, conclusion := extractCIStatus(m, "workflow_job")
+	runID, _ := strconv.ParseInt(ext(m, "workflow_job", "run_id"), 10, 64)
+	duration := ""
+	if conclusion != "" {
+		startedAtStr := ext(m, "workflow_job", "started_at")
+		completedAtStr := ext(m, "workflow_job", "completed_at")
+		if startedAtStr != "" && completedAtStr != "" {
+			if startedAt, err := time.Parse(time.RFC3339, startedAtStr); err == nil {
+				if completedAt, err := time.Parse(time.RFC3339, completedAtStr); err == nil {
+					duration = FormatDuration(completedAt.Sub(startedAt))
+				}
+			}
+		}
+	}
+	jobID := ext(m, "workflow_job", "id")
+	if jobID == "" {
+		jobID = ext(m, "workflow_job", "name")
+	}
+	return CIStatus{
+		WorkflowName: "job:" + jobID,
+		JobName:      ext(m, "workflow_job", "name"),
+		Status:       status,
+		Conclusion:   conclusion,
+		RunID:        runID,
+		ParentRunID:  runID,
+		Ref:          ref,
+		Duration:     duration,
+		UpdatedAt:    detail.EventTime,
+	}
+}
+
+func upsertCIStatus(statuses []CIStatus, status CIStatus) []CIStatus {
+	key := status.WorkflowName
+	for i, existing := range statuses {
+		if existing.WorkflowName == key {
+			statuses[i] = status
+			return statuses
+		}
+	}
+	return append(statuses, status)
+}
+
 func findMessageRecordByGithubID(ctx context.Context, githubID string) *MessageRecord {
 	if githubID == "" || DB == nil {
 		return nil
@@ -323,6 +384,31 @@ func findMessageRecordByGithubID(ctx context.Context, githubID string) *MessageR
 		Where("github_id = ?", githubID).
 		Order("id DESC").
 		Limit(1).Scan(ctx); err == nil {
+		return &record
+	}
+	return nil
+}
+
+func findWorkflowRunRecordForJob(ctx context.Context, repo string, m map[string]any) *MessageRecord {
+	if repo == "" || DB == nil {
+		return nil
+	}
+	runID := ext(m, "workflow_job", "run_id")
+	if runID == "" {
+		return nil
+	}
+	baseID := "wf:" + runID
+	var record MessageRecord
+	q := DB.NewSelect().Model(&record).
+		Where("repo_name = ?", repo).
+		Where("event_type = ?", "workflow_run")
+	if attempt := ext(m, "workflow_job", "run_attempt"); attempt != "" && attempt != "1" {
+		q = q.Where("github_id = ?", fmt.Sprintf("%s:attempt:%s", baseID, attempt))
+	} else {
+		attemptPattern := escapeSQLLikePattern(baseID) + ":attempt:%"
+		q = q.Where("(github_id = ? OR github_id LIKE ? ESCAPE '\\')", baseID, attemptPattern)
+	}
+	if err := q.Order("updated_at DESC").Order("id DESC").Limit(1).Scan(ctx); err == nil {
 		return &record
 	}
 	return nil
@@ -407,6 +493,97 @@ func maybeSendWorkflowTimeoutNotification(ctx context.Context, record *MessageRe
 	}
 }
 
+func updateWorkflowRunRecordWithJob(
+	ctx context.Context,
+	record *MessageRecord,
+	event WebhookEvent,
+	m map[string]any,
+	jobDetail EventDetail,
+	repo, sender, senderUrl, avatarUrl, ref, sha string,
+) (EventDetail, string, error) {
+	if record == nil {
+		return EventDetail{}, "", nil
+	}
+	var existingDetail EventDetail
+	_ = json.Unmarshal([]byte(record.Content), &existingDetail)
+	if existingDetail.RepoURL == "" {
+		if repoURL := ext(m, "repository", "html_url"); repoURL != "" {
+			existingDetail.RepoURL = repoURL
+		} else if record.RepoName != "" {
+			existingDetail.RepoURL = fmt.Sprintf("https://github.com/%s", record.RepoName)
+		}
+	}
+	if existingDetail.RepoName == "" {
+		existingDetail.RepoName = repo
+	}
+	if existingDetail.EventTime == "" {
+		existingDetail.EventTime = jobDetail.EventTime
+	}
+
+	jobStatus := workflowJobStatus(m, jobDetail, ref)
+	existingDetail.CIStatuses = upsertCIStatus(existingDetail.CIStatuses, jobStatus)
+
+	cardRepo := record.RepoName
+	if cardRepo == "" {
+		cardRepo = repo
+	}
+	cardSender := record.Sender
+	if cardSender == "" {
+		cardSender = sender
+	}
+	cardSenderURL := record.SenderURL
+	if cardSenderURL == "" {
+		cardSenderURL = senderUrl
+	}
+	cardAvatarURL := record.AvatarURL2
+	if cardAvatarURL == "" {
+		cardAvatarURL = avatarUrl
+	}
+
+	card, err := buildCardWithTimeout(ctx, cardRepo, cardSender, cardSenderURL, cardAvatarURL, existingDetail)
+	if err != nil {
+		return EventDetail{}, "", err
+	}
+
+	oldMsgID := record.FeishuMessageID
+	msgID := record.FeishuMessageID
+	parentMsgID := record.ParentMsgID
+	if record.ParentMsgID != "" {
+		msgID, err = SendToChat("", card)
+		if err != nil {
+			return EventDetail{}, "", fmt.Errorf("failed to send standalone workflow card: %w", err)
+		}
+		record.FeishuMessageID = msgID
+		record.ParentMsgID = ""
+	} else if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
+		return EventDetail{}, "", fmt.Errorf("failed to update workflow card with job: %w", err)
+	}
+
+	updatedJson, _ := json.Marshal(existingDetail)
+	updateQ := DB.NewUpdate().Model(record).
+		Set("content = ?", string(updatedJson)).
+		Set("card_string = ?", card.String()).
+		Set("event_id = ?", event.ID).
+		Set("updated_at = ?", time.Now()).
+		WherePK()
+	if msgID != oldMsgID {
+		updateQ = updateQ.Set("feishu_message_id = ?", msgID)
+	}
+	if parentMsgID != "" {
+		updateQ = updateQ.Set("parent_msg_id = ?", "")
+	}
+	if sha != "" {
+		updateQ = updateQ.Set("head_sha = ?", sha)
+	}
+	if _, err = updateQ.Exec(ctx); err != nil {
+		return EventDetail{}, "", err
+	}
+	if parentMsgID != "" {
+		clearParentCardCI(ctx, parentMsgID)
+	}
+	return existingDetail, card.String(), nil
+}
+
 func updateWorkflowRunRecord(
 	ctx context.Context,
 	record *MessageRecord,
@@ -427,6 +604,20 @@ func updateWorkflowRunRecord(
 	}
 
 	switchingGithubID := newGithubID != "" && newGithubID != record.GithubID
+	if !switchingGithubID {
+		var previousDetail EventDetail
+		if err := json.Unmarshal([]byte(record.Content), &previousDetail); err == nil {
+			runID := int64(0)
+			if len(detail.CIStatuses) > 0 {
+				runID = detail.CIStatuses[0].RunID
+			}
+			for _, cs := range previousDetail.CIStatuses {
+				if strings.HasPrefix(cs.WorkflowName, "job:") && (runID == 0 || cs.ParentRunID == runID) {
+					detail.CIStatuses = upsertCIStatus(detail.CIStatuses, cs)
+				}
+			}
+		}
+	}
 	if switchingGithubID {
 		resetWorkflowTimeoutNotification(ctx, record)
 	}
@@ -451,11 +642,24 @@ func updateWorkflowRunRecord(
 	}
 
 	if record.ParentMsgID != "" {
-		if _, err := updateQ.Exec(ctx); err != nil {
+		card, err := buildCardWithTimeout(ctx, repo, sender, senderUrl, avatarUrl, detail)
+		if err != nil {
 			return err
 		}
-		updateParentCardWithCI(ctx, record.ParentMsgID)
-		return nil
+		msgID, err := SendToChat("", card)
+		if err != nil {
+			return fmt.Errorf("failed to send standalone workflow card: %w", err)
+		}
+		parentMsgID := record.ParentMsgID
+		_, err = updateQ.
+			Set("feishu_message_id = ?", msgID).
+			Set("parent_msg_id = ?", "").
+			Set("card_string = ?", card.String()).
+			Exec(ctx)
+		if err == nil {
+			clearParentCardCI(ctx, parentMsgID)
+		}
+		return err
 	}
 
 	card, err := buildCardWithTimeout(ctx, repo, sender, senderUrl, avatarUrl, detail)
@@ -700,6 +904,43 @@ func updateParentCardWithCI(ctx context.Context, parentMsgID string) {
 		WherePK().Exec(ctx)
 }
 
+func clearParentCardCI(ctx context.Context, parentMsgID string) {
+	if parentMsgID == "" || DB == nil {
+		return
+	}
+	var parentRecord MessageRecord
+	if err := DB.NewSelect().Model(&parentRecord).
+		Where("feishu_message_id = ?", parentMsgID).
+		Where("event_type NOT IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
+		Order("id ASC").Limit(1).Scan(ctx); err != nil {
+		return
+	}
+	var parentDetail EventDetail
+	_ = json.Unmarshal([]byte(parentRecord.Content), &parentDetail)
+	if len(parentDetail.CIStatuses) == 0 {
+		return
+	}
+	parentDetail.CIStatuses = nil
+	if parentDetail.RepoURL == "" && parentRecord.RepoName != "" {
+		parentDetail.RepoURL = fmt.Sprintf("https://github.com/%s", parentRecord.RepoName)
+	}
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+	card := BuildCard(buildCtx, parentRecord.RepoName, parentRecord.Sender, parentRecord.SenderURL, parentRecord.AvatarURL2, parentDetail)
+	buildCancel()
+
+	if err := UpdateMessage(parentMsgID, card); err != nil {
+		slog.Error("Failed to clear CI status from parent card", "parent", parentMsgID, "error", err)
+		return
+	}
+	detailJson, _ := json.Marshal(parentDetail)
+	_, _ = DB.NewUpdate().Model(&parentRecord).
+		Set("content = ?", string(detailJson)).
+		Set("card_string = ?", card.String()).
+		Set("updated_at = ?", time.Now()).
+		WherePK().Exec(ctx)
+}
+
 // detectPRMerge 检测 push 是否为 PR 合并，如果是则更新 PR 卡片而非创建新的 push 消息
 // 返回 true 表示已处理（调用方应立即返回）
 func detectPRMerge(ctx context.Context, event WebhookEvent, m map[string]any, detail *EventDetail,
@@ -769,7 +1010,6 @@ func detectPRMerge(ctx context.Context, event WebhookEvent, m map[string]any, de
 
 func processWebhookEvent(event WebhookEvent) error {
 	ctx := context.Background()
-	var parentMsgID string // CI 事件关联的父消息 ID
 	var previousWorkflowRunRecord *MessageRecord
 
 	// 1. 解析 Payload
@@ -1023,6 +1263,58 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
+	if event.EventType == "workflow_job" && githubID != "" {
+		if workflowRecord := findWorkflowRunRecordForJob(ctx, repo, m); workflowRecord != nil {
+			workflowDetail, workflowCardString, err := updateWorkflowRunRecordWithJob(ctx, workflowRecord, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha)
+			if err != nil {
+				return err
+			}
+
+			workflowDetailJson, _ := json.Marshal(workflowDetail)
+			_, insertErr := DB.NewInsert().Model(&MessageRecord{
+				GithubID:        githubID,
+				FeishuMessageID: workflowRecord.FeishuMessageID,
+				ChatID:          C.Feishu.ChatID,
+				RepoName:        repo,
+				Ref:             ref,
+				EventType:       event.EventType,
+				Content:         string(workflowDetailJson),
+				CardString:      workflowCardString,
+				EventID:         event.ID,
+				HeadSHA:         sha,
+				Sender:          sender,
+				SenderURL:       senderUrl,
+				AvatarURL2:      avatarUrl,
+			}).On("CONFLICT (github_id) DO UPDATE").
+				Set("feishu_message_id = EXCLUDED.feishu_message_id").
+				Set("content = EXCLUDED.content").
+				Set("card_string = EXCLUDED.card_string").
+				Set("event_id = EXCLUDED.event_id").
+				Set("updated_at = NOW()").
+				Set("head_sha = EXCLUDED.head_sha").
+				Set("parent_msg_id = EXCLUDED.parent_msg_id").
+				Exec(ctx)
+			if insertErr != nil {
+				slog.Error("Failed to upsert workflow job record", "github_id", githubID, "error", insertErr)
+			}
+
+			slog.Info("Workflow job updated workflow card", "github_id", githubID, "workflow", workflowRecord.GithubID)
+			return nil
+		}
+
+		if event.RescheduleCount < 5 {
+			slog.Info("Rescheduling workflow job, waiting for workflow_run", "github_id", githubID, "run_id", ext(m, "workflow_job", "run_id"), "reschedule", event.RescheduleCount+1)
+			_, _ = DB.NewUpdate().Model(&event).
+				Set("status = ?", "pending").
+				Set("reschedule_count = reschedule_count + 1").
+				Set("updated_at = ?", time.Now()).
+				WherePK().Exec(ctx)
+			return nil
+		}
+
+		detail.CIStatuses = []CIStatus{workflowJobStatus(m, detail, ref)}
+	}
+
 	if isCIEvent && githubID != "" {
 		var record MessageRecord
 		err := DB.NewSelect().Model(&record).
@@ -1038,92 +1330,47 @@ func processWebhookEvent(event WebhookEvent) error {
 			}
 			maybeSendWorkflowTimeoutNotification(ctx, &record, status, conclusion, detail.Title)
 
-			if record.ParentMsgID != "" {
-				// CI 内联模式：更新 CI 记录，然后刷新父消息卡片
-				detailJson, _ := json.Marshal(detail)
-				_, _ = DB.NewUpdate().Model(&record).
-					Set("content = ?", string(detailJson)).
-					Set("updated_at = ?", time.Now()).
-					WherePK().Exec(ctx)
-				updateParentCardWithCI(ctx, record.ParentMsgID)
-				slog.Info("CI status updated (inline)", "github_id", githubID, "parent", record.ParentMsgID)
-				return nil
-			}
-
 			// 兼容旧模式：独立 CI 消息
 			// workflow_job 事件：将 job 信息追加到 CIStatuses，而不是覆盖
 			if event.EventType == "workflow_job" {
 				var existingDetail EventDetail
 				_ = json.Unmarshal([]byte(record.Content), &existingDetail)
 
-				// 从 payload 提取 job 信息
-				jobName := ext(m, "workflow_job", "name")
-				jobStatus, jobConclusion := extractCIStatus(m, event.EventType)
-				jobRunID, _ := strconv.ParseInt(ext(m, "workflow_job", "run_id"), 10, 64)
-				jobDuration := ""
-				if jobConclusion != "" {
-					startedAtStr := ext(m, "workflow_job", "started_at")
-					completedAtStr := ext(m, "workflow_job", "completed_at")
-					if startedAtStr != "" && completedAtStr != "" {
-						if t1, err := time.Parse(time.RFC3339, startedAtStr); err == nil {
-							if t2, err := time.Parse(time.RFC3339, completedAtStr); err == nil {
-								jobDuration = FormatDuration(t2.Sub(t1))
-							}
-						}
-					}
-				}
-
-				// 查找并更新或追加 job 状态
-				jobKey := "job:" + ext(m, "workflow_job", "id")
-				found := false
-				for i, cs := range existingDetail.CIStatuses {
-					if cs.WorkflowName == jobKey {
-						existingDetail.CIStatuses[i] = CIStatus{
-							WorkflowName: jobKey,
-							JobName:      jobName,
-							Status:       jobStatus,
-							Conclusion:   jobConclusion,
-							RunID:        jobRunID,
-							ParentRunID:  jobRunID,
-							Ref:          ref,
-							Duration:     jobDuration,
-							UpdatedAt:    detail.EventTime,
-						}
-						found = true
-						break
-					}
-				}
-				if !found {
-					existingDetail.CIStatuses = append(existingDetail.CIStatuses, CIStatus{
-						WorkflowName: jobKey,
-						JobName:      jobName,
-						Status:       jobStatus,
-						Conclusion:   jobConclusion,
-						RunID:        jobRunID,
-						ParentRunID:  jobRunID,
-						Ref:          ref,
-						Duration:     jobDuration,
-						UpdatedAt:    detail.EventTime,
-					})
-				}
+				existingDetail.CIStatuses = upsertCIStatus(existingDetail.CIStatuses, workflowJobStatus(m, detail, ref))
 
 				// 重建卡片
 				buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
 				card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, existingDetail)
 				buildCancel()
 
-				if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
+				parentMsgID := record.ParentMsgID
+				if parentMsgID != "" {
+					msgID, sendErr := SendToChat("", card)
+					if sendErr != nil {
+						return fmt.Errorf("failed to send standalone workflow job card: %w", sendErr)
+					}
+					record.FeishuMessageID = msgID
+					record.ParentMsgID = ""
+				} else if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
 					return fmt.Errorf("failed to update message: %w", err)
 				}
 
 				updatedJson, _ := json.Marshal(existingDetail)
-				_, _ = DB.NewUpdate().Model(&record).
+				updateQ := DB.NewUpdate().Model(&record).
 					Set("content = ?", string(updatedJson)).
 					Set("card_string = ?", card.String()).
 					Set("updated_at = ?", time.Now()).
-					WherePK().Exec(ctx)
+					WherePK()
+				updateQ = updateQ.Set("parent_msg_id = ?", record.ParentMsgID)
+				updateQ = updateQ.Set("feishu_message_id = ?", record.FeishuMessageID)
+				if _, updateErr := updateQ.Exec(ctx); updateErr != nil {
+					return updateErr
+				}
+				if parentMsgID != "" {
+					clearParentCardCI(ctx, parentMsgID)
+				}
 
-				slog.Info("Workflow job appended", "github_id", githubID, "job", jobName)
+				slog.Info("Workflow job appended", "github_id", githubID, "job", ext(m, "workflow_job", "name"))
 				return nil
 			}
 
@@ -1132,16 +1379,31 @@ func processWebhookEvent(event WebhookEvent) error {
 			card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
 			buildCancel()
 
-			if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
+			parentMsgID := record.ParentMsgID
+			if parentMsgID != "" {
+				msgID, sendErr := SendToChat("", card)
+				if sendErr != nil {
+					return fmt.Errorf("failed to send standalone CI card: %w", sendErr)
+				}
+				record.FeishuMessageID = msgID
+				record.ParentMsgID = ""
+			} else if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
 				return fmt.Errorf("failed to update message: %w", err)
 			}
 
 			detailJson, _ := json.Marshal(detail)
-			_, _ = DB.NewUpdate().Model(&record).
+			if _, updateErr := DB.NewUpdate().Model(&record).
 				Set("content = ?", string(detailJson)).
 				Set("card_string = ?", card.String()).
 				Set("updated_at = ?", time.Now()).
-				WherePK().Exec(ctx)
+				Set("feishu_message_id = ?", record.FeishuMessageID).
+				Set("parent_msg_id = ?", record.ParentMsgID).
+				WherePK().Exec(ctx); updateErr != nil {
+				return updateErr
+			}
+			if parentMsgID != "" {
+				clearParentCardCI(ctx, parentMsgID)
+			}
 
 			slog.Info("Workflow card updated", "github_id", githubID, "event_type", event.EventType)
 			return nil
@@ -1378,7 +1640,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
-	// 4.6 Tag/Workflow 关联最近的 commit，以话题形式回复
+	// 4.6 Tag 关联最近的 commit，以话题形式回复。CI/Workflow 独立成卡，不再混入 commit 卡片。
 	var parentID string
 	if event.EventType == "create" && detail.IsTag {
 		if sha != "" {
@@ -1390,221 +1652,10 @@ func processWebhookEvent(event WebhookEvent) error {
 			parentID = findRecentRepoPush(ctx, repo)
 		}
 	}
-	if isCIEvent && parentID == "" {
-		// CI 事件未找到已有记录（否则已在 4.1 返回），通过 head_sha 精确关联
-		if sha != "" {
-			var record MessageRecord
-			if err := DB.NewSelect().Model(&record).
-				Where("repo_name = ?", repo).
-				Where("event_type IN ('push', 'create')").
-				Where("head_sha = ?", sha).
-				Where("record_type != 'deleted'").
-				OrderExpr("CASE event_type WHEN 'create' THEN 0 ELSE 1 END").
-				Order("id ASC").
-				Limit(1).Scan(ctx); err == nil {
-				// 父消息过旧（workflow 重新运行），不内联，创建独立消息
-				if time.Since(record.UpdatedAt) > getMergeWindow() {
-					slog.Info("CI event: parent too old, creating standalone message", "sha", sha, "parent_id", record.FeishuMessageID, "parent_age", time.Since(record.UpdatedAt))
-				} else {
-					parentID = record.FeishuMessageID
-					parentMsgID = record.FeishuMessageID
-					slog.Info("CI event found parent by head_sha", "sha", sha, "parent_event", record.EventType, "parent_id", parentID)
-				}
-			} else {
-				slog.Warn("CI event: no parent found by head_sha", "sha", sha, "repo", repo, "error", err)
-			}
-		}
-		// SHA 匹配失败时，回退查找同仓库最近的 tag 创建消息（tag 的 head_sha 可能为空）
-		if isCIEvent && parentID == "" {
-			if rec := findRecentRepoTag(ctx, repo); rec != nil {
-				parentID = rec.FeishuMessageID
-				parentMsgID = rec.FeishuMessageID
-				slog.Info("CI event found parent by recent tag fallback", "parent_event", rec.EventType, "parent_id", parentID)
-			}
-		}
-		// 找不到父消息，检查关联的 push/create 事件是否还在队列中或等待重试（事件到达顺序不确定）
-		if isCIEvent && parentID == "" && event.RescheduleCount < 5 {
-			shouldReschedule := false
-			if sha != "" {
-				// 同 SHA 的 push 事件还在队列中
-				var pendingPush WebhookEvent
-				if err := DB.NewSelect().Model(&pendingPush).
-					Where("id != ?", event.ID).
-					Where("event_type = ?", "push").
-					Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
-					Where("head_sha = ?", sha).
-					Limit(1).Scan(ctx); err == nil {
-					shouldReschedule = true
-				}
-			}
-			// tag 触发的 workflow：create 事件可能还在队列中（head_sha 为空，无法用 SHA 关联）
-			if !shouldReschedule && ref != "" {
-				var pendingCreate WebhookEvent
-				if err := DB.NewSelect().Model(&pendingCreate).
-					Where("id != ?", event.ID).
-					Where("event_type = ?", "create").
-					Where("status IN ('pending', 'processing') OR (status = 'failed' AND retry_count < 5)").
-					Where("ref = ?", ref).
-					Limit(1).Scan(ctx); err == nil {
-					shouldReschedule = true
-				}
-			}
-			if shouldReschedule {
-				slog.Info("Rescheduling CI event, waiting for parent event", "sha", sha, "ref", ref, "event_type", event.EventType, "reschedule", event.RescheduleCount+1)
-				_, _ = DB.NewUpdate().Model(&event).
-					Set("status = ?", "pending").
-					Set("reschedule_count = reschedule_count + 1").
-					Set("updated_at = ?", time.Now()).
-					WherePK().Exec(ctx)
-				return nil
-			}
-		}
-	}
-
-	// 4.7 CI 事件内联到父消息：保存 CI 记录并更新父消息卡片
-	if isCIEvent && parentMsgID != "" {
-		workflowStartedAt := time.Time{}
-		status, conclusion := extractCIStatus(m, event.EventType)
-		if status == "in_progress" && conclusion == "" {
-			workflowStartedAt = nextWorkflowStartedAt(time.Time{}, true, m, status, conclusion)
-		}
-		// 构建初始 CIStatus 供 getCIStatusesForParent 直接读取
-		ciStatus := CIStatus{
-			WorkflowName: detail.Title,
-			Status:       status,
-			Conclusion:   conclusion,
-			UpdatedAt:    detail.EventTime,
-		}
-		if event.EventType == "workflow_run" {
-			ciStatus.RunID, _ = strconv.ParseInt(ext(m, "workflow_run", "id"), 10, 64)
-		} else if event.EventType == "workflow_job" {
-			ciStatus.JobName = ext(m, "workflow_job", "name")
-			ciStatus.RunID, _ = strconv.ParseInt(ext(m, "workflow_job", "run_id"), 10, 64)
-			ciStatus.ParentRunID = ciStatus.RunID
-		}
-		detail.CIStatuses = []CIStatus{ciStatus}
-		detailJson, _ := json.Marshal(detail)
-
-		if _, insertErr := DB.NewInsert().Model(&MessageRecord{
-			GithubID:          githubID,
-			FeishuMessageID:   parentMsgID, // 指向父消息，用于查询
-			ChatID:            C.Feishu.ChatID,
-			RepoName:          repo,
-			EventType:         event.EventType,
-			Content:           string(detailJson),
-			EventID:           event.ID,
-			WorkflowStartedAt: workflowStartedAt,
-			HeadSHA:           sha,
-			ParentMsgID:       parentMsgID,
-		}).Exec(ctx); insertErr != nil {
-			// GithubID 唯一约束处理幂等，其他错误记录日志
-			if !strings.Contains(insertErr.Error(), "duplicate key") {
-				slog.Error("Failed to insert CI record", "github_id", githubID, "error", insertErr)
-			}
-		}
-		updateParentCardWithCI(ctx, parentMsgID)
-		slog.Info("CI event inlined to parent", "github_id", githubID, "parent", parentMsgID)
-		return nil
-	}
-
-	workflowRerunOutsideMergeWindow := event.EventType == "workflow_run" && previousWorkflowRunRecord != nil
-
-	// 4.8 CI 事件无父消息时的处理：普通 in_progress 静默丢弃；历史 workflow rerun 允许创建独立消息
-	if isCIEvent && parentMsgID == "" && !workflowRerunOutsideMergeWindow {
-		status, _ := extractCIStatus(m, event.EventType)
-		if status == "in_progress" || status == "queued" || status == "waiting" {
-			slog.Info("CI event suppressed (no parent, in_progress)", "github_id", githubID, "status", status)
-			return nil
-		}
-	}
-
-	// 4.9 CI 事件合并：同一 commit 的多个 workflow 合并显示（仅在合并窗口内）
-	if isCIEvent && parentMsgID == "" && sha != "" && !workflowRerunOutsideMergeWindow {
-		var existingCIRecord MessageRecord
-		if err := DB.NewSelect().Model(&existingCIRecord).
-			Where("event_type IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
-			Where("head_sha = ?", sha).
-			Where("repo_name = ?", repo).
-			Where("parent_msg_id = ''").
-			Where("updated_at > ?", time.Now().Add(-getMergeWindow())).
-			Order("id ASC").Limit(1).Scan(ctx); err == nil {
-			// 找到同一 commit 的 CI 消息，合并 CI 状态
-			var existingDetail EventDetail
-			_ = json.Unmarshal([]byte(existingCIRecord.Content), &existingDetail)
-
-			// 从 payload 提取 CI 信息
-			ciStatus, ciConclusion := extractCIStatus(m, event.EventType)
-			ciWorkflowName := detail.Title
-			ciRunID := int64(0)
-			ciDuration := ""
-			if event.EventType == "workflow_run" {
-				ciRunID, _ = strconv.ParseInt(ext(m, "workflow_run", "id"), 10, 64)
-				// 尝试从 workflow_run 对象中提取时间计算耗时
-				if wr, ok := m["workflow_run"].(map[string]any); ok {
-					if startedAtStr, ok := wr["run_started_at"].(string); ok {
-						if updatedAtStr, ok := wr["updated_at"].(string); ok {
-							if t1, err := time.Parse(time.RFC3339, startedAtStr); err == nil {
-								if t2, err := time.Parse(time.RFC3339, updatedAtStr); err == nil {
-									ciDuration = FormatDuration(t2.Sub(t1))
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// 检查是否已有同一 workflow 的状态，有则更新，无则追加
-			found := false
-			for i, cs := range existingDetail.CIStatuses {
-				if cs.RunID == ciRunID && ciRunID > 0 {
-					existingDetail.CIStatuses[i] = CIStatus{
-						WorkflowName: ciWorkflowName,
-						Status:       ciStatus,
-						Conclusion:   ciConclusion,
-						RunID:        ciRunID,
-						Ref:          ref,
-						Duration:     ciDuration,
-						UpdatedAt:    detail.EventTime,
-					}
-					found = true
-					break
-				}
-			}
-			if !found {
-				existingDetail.CIStatuses = append(existingDetail.CIStatuses, CIStatus{
-					WorkflowName: ciWorkflowName,
-					Status:       ciStatus,
-					Conclusion:   ciConclusion,
-					RunID:        ciRunID,
-					Ref:          ref,
-					Duration:     ciDuration,
-					UpdatedAt:    detail.EventTime,
-				})
-			}
-
-			// 重建卡片
-			buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
-			card := BuildCard(buildCtx, repo, existingCIRecord.Sender, existingCIRecord.SenderURL, existingCIRecord.AvatarURL2, existingDetail)
-			buildCancel()
-
-			if err := UpdateMessage(existingCIRecord.FeishuMessageID, card); err != nil {
-				slog.Error("Failed to update merged CI card", "error", err)
-			} else {
-				updatedJson, _ := json.Marshal(existingDetail)
-				_, _ = DB.NewUpdate().Model(&existingCIRecord).
-					Set("content = ?", string(updatedJson)).
-					Set("card_string = ?", card.String()).
-					Set("updated_at = ?", time.Now()).
-					WherePK().Exec(ctx)
-				slog.Info("CI event merged with existing", "github_id", githubID, "existing_id", existingCIRecord.GithubID)
-			}
-			return nil
-		}
-	}
 
 	// 5. 查找父级 ID (回复逻辑)
 	// 改为：只要是 Issue/PR/Discussion 相关的非"创建"事件，都尝试寻找父消息进行话题回复
-	// 注意：CI 事件不在这里处理，它们的父消息已在 4.6 通过 head_sha 精确关联
+	// 注意：CI/Workflow 事件不在这里处理，它们独立成卡，由 4.1 维护状态。
 	// 注意：评论合并（4.5a）在本步骤之前执行，已合并的评论不会进入本逻辑
 	isInteraction := event.EventType == "issue_comment" ||
 		event.EventType == "pull_request_review_comment" ||
@@ -1797,7 +1848,6 @@ func processWebhookEvent(event WebhookEvent) error {
 			WorkflowStartedAt: workflowStartedAt,
 			HeadSHA:           headSHA,
 			RecordType:        recordType,
-			ParentMsgID:       parentMsgID,
 			Sender:            sender,
 			SenderURL:         senderUrl,
 			AvatarURL2:        avatarUrl,
