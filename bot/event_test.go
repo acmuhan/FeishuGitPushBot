@@ -530,6 +530,14 @@ func TestWorkflowRunRerunNoticeUsesAttemptMetadata(t *testing.T) {
 	}
 }
 
+func TestEscapeSQLLikePattern(t *testing.T) {
+	got := escapeSQLLikePattern(`wf:12_%\34`)
+	want := `wf:12\_\%\\34`
+	if got != want {
+		t.Fatalf("escapeSQLLikePattern() = %q", got)
+	}
+}
+
 func TestSendNewEventTypeCards(t *testing.T) {
 	LoadConfig()
 	InitDB()

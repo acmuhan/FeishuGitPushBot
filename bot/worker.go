@@ -328,16 +328,24 @@ func findMessageRecordByGithubID(ctx context.Context, githubID string) *MessageR
 	return nil
 }
 
+func escapeSQLLikePattern(pattern string) string {
+	pattern = strings.ReplaceAll(pattern, `\`, `\\`)
+	pattern = strings.ReplaceAll(pattern, `%`, `\%`)
+	pattern = strings.ReplaceAll(pattern, `_`, `\_`)
+	return pattern
+}
+
 func findPreviousWorkflowRunRecord(ctx context.Context, repo, baseID, currentID string) *MessageRecord {
 	if repo == "" || baseID == "" || DB == nil {
 		return nil
 	}
+	attemptPattern := escapeSQLLikePattern(baseID) + ":attempt:%"
 	var record MessageRecord
 	if err := DB.NewSelect().Model(&record).
 		Where("repo_name = ?", repo).
 		Where("event_type = ?", "workflow_run").
 		Where("github_id != ?", currentID).
-		Where("(github_id = ? OR github_id LIKE ?)", baseID, baseID+":attempt:%").
+		Where("(github_id = ? OR github_id LIKE ? ESCAPE '\\')", baseID, attemptPattern).
 		Order("updated_at DESC").
 		Order("id DESC").
 		Limit(1).Scan(ctx); err == nil {
