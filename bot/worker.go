@@ -366,15 +366,8 @@ func workflowJobStatus(m map[string]any, detail EventDetail, ref string) CIStatu
 
 func upsertCIStatus(statuses []CIStatus, status CIStatus) []CIStatus {
 	key := status.WorkflowName
-	if strings.HasPrefix(key, "job:") && status.JobName != "" {
-		key = status.WorkflowName
-	}
 	for i, existing := range statuses {
-		existingKey := existing.WorkflowName
-		if strings.HasPrefix(existingKey, "job:") && existing.WorkflowName != "" {
-			existingKey = existing.WorkflowName
-		}
-		if existingKey == key {
+		if existing.WorkflowName == key {
 			statuses[i] = status
 			return statuses
 		}
@@ -507,9 +500,9 @@ func updateWorkflowRunRecordWithJob(
 	m map[string]any,
 	jobDetail EventDetail,
 	repo, sender, senderUrl, avatarUrl, ref, sha string,
-) error {
+) (EventDetail, string, error) {
 	if record == nil {
-		return nil
+		return EventDetail{}, "", nil
 	}
 	var existingDetail EventDetail
 	_ = json.Unmarshal([]byte(record.Content), &existingDetail)
@@ -549,7 +542,7 @@ func updateWorkflowRunRecordWithJob(
 
 	card, err := buildCardWithTimeout(ctx, cardRepo, cardSender, cardSenderURL, cardAvatarURL, existingDetail)
 	if err != nil {
-		return err
+		return EventDetail{}, "", err
 	}
 
 	oldMsgID := record.FeishuMessageID
@@ -558,13 +551,12 @@ func updateWorkflowRunRecordWithJob(
 	if record.ParentMsgID != "" {
 		msgID, err = SendToChat("", card)
 		if err != nil {
-			return fmt.Errorf("failed to send standalone workflow card: %w", err)
+			return EventDetail{}, "", fmt.Errorf("failed to send standalone workflow card: %w", err)
 		}
-		clearParentCardCI(ctx, record.ParentMsgID)
 		record.FeishuMessageID = msgID
 		record.ParentMsgID = ""
 	} else if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
-		return fmt.Errorf("failed to update workflow card with job: %w", err)
+		return EventDetail{}, "", fmt.Errorf("failed to update workflow card with job: %w", err)
 	}
 
 	updatedJson, _ := json.Marshal(existingDetail)
@@ -583,8 +575,13 @@ func updateWorkflowRunRecordWithJob(
 	if sha != "" {
 		updateQ = updateQ.Set("head_sha = ?", sha)
 	}
-	_, err = updateQ.Exec(ctx)
-	return err
+	if _, err = updateQ.Exec(ctx); err != nil {
+		return EventDetail{}, "", err
+	}
+	if parentMsgID != "" {
+		clearParentCardCI(ctx, parentMsgID)
+	}
+	return existingDetail, card.String(), nil
 }
 
 func updateWorkflowRunRecord(
@@ -653,12 +650,15 @@ func updateWorkflowRunRecord(
 		if err != nil {
 			return fmt.Errorf("failed to send standalone workflow card: %w", err)
 		}
-		clearParentCardCI(ctx, record.ParentMsgID)
+		parentMsgID := record.ParentMsgID
 		_, err = updateQ.
 			Set("feishu_message_id = ?", msgID).
 			Set("parent_msg_id = ?", "").
 			Set("card_string = ?", card.String()).
 			Exec(ctx)
+		if err == nil {
+			clearParentCardCI(ctx, parentMsgID)
+		}
 		return err
 	}
 
@@ -1265,13 +1265,12 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	if event.EventType == "workflow_job" && githubID != "" {
 		if workflowRecord := findWorkflowRunRecordForJob(ctx, repo, m); workflowRecord != nil {
-			if err := updateWorkflowRunRecordWithJob(ctx, workflowRecord, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha); err != nil {
+			workflowDetail, workflowCardString, err := updateWorkflowRunRecordWithJob(ctx, workflowRecord, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha)
+			if err != nil {
 				return err
 			}
 
-			jobDetail := detail
-			jobDetail.CIStatuses = []CIStatus{workflowJobStatus(m, detail, ref)}
-			jobDetailJson, _ := json.Marshal(jobDetail)
+			workflowDetailJson, _ := json.Marshal(workflowDetail)
 			_, insertErr := DB.NewInsert().Model(&MessageRecord{
 				GithubID:        githubID,
 				FeishuMessageID: workflowRecord.FeishuMessageID,
@@ -1279,7 +1278,8 @@ func processWebhookEvent(event WebhookEvent) error {
 				RepoName:        repo,
 				Ref:             ref,
 				EventType:       event.EventType,
-				Content:         string(jobDetailJson),
+				Content:         string(workflowDetailJson),
+				CardString:      workflowCardString,
 				EventID:         event.ID,
 				HeadSHA:         sha,
 				Sender:          sender,
@@ -1288,6 +1288,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			}).On("CONFLICT (github_id) DO UPDATE").
 				Set("feishu_message_id = EXCLUDED.feishu_message_id").
 				Set("content = EXCLUDED.content").
+				Set("card_string = EXCLUDED.card_string").
 				Set("event_id = EXCLUDED.event_id").
 				Set("updated_at = NOW()").
 				Set("head_sha = EXCLUDED.head_sha").
@@ -1342,12 +1343,12 @@ func processWebhookEvent(event WebhookEvent) error {
 				card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, existingDetail)
 				buildCancel()
 
-				if record.ParentMsgID != "" {
+				parentMsgID := record.ParentMsgID
+				if parentMsgID != "" {
 					msgID, sendErr := SendToChat("", card)
 					if sendErr != nil {
 						return fmt.Errorf("failed to send standalone workflow job card: %w", sendErr)
 					}
-					clearParentCardCI(ctx, record.ParentMsgID)
 					record.FeishuMessageID = msgID
 					record.ParentMsgID = ""
 				} else if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
@@ -1362,7 +1363,12 @@ func processWebhookEvent(event WebhookEvent) error {
 					WherePK()
 				updateQ = updateQ.Set("parent_msg_id = ?", record.ParentMsgID)
 				updateQ = updateQ.Set("feishu_message_id = ?", record.FeishuMessageID)
-				_, _ = updateQ.Exec(ctx)
+				if _, updateErr := updateQ.Exec(ctx); updateErr != nil {
+					return updateErr
+				}
+				if parentMsgID != "" {
+					clearParentCardCI(ctx, parentMsgID)
+				}
 
 				slog.Info("Workflow job appended", "github_id", githubID, "job", ext(m, "workflow_job", "name"))
 				return nil
@@ -1373,12 +1379,12 @@ func processWebhookEvent(event WebhookEvent) error {
 			card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
 			buildCancel()
 
-			if record.ParentMsgID != "" {
+			parentMsgID := record.ParentMsgID
+			if parentMsgID != "" {
 				msgID, sendErr := SendToChat("", card)
 				if sendErr != nil {
 					return fmt.Errorf("failed to send standalone CI card: %w", sendErr)
 				}
-				clearParentCardCI(ctx, record.ParentMsgID)
 				record.FeishuMessageID = msgID
 				record.ParentMsgID = ""
 			} else if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
@@ -1386,13 +1392,18 @@ func processWebhookEvent(event WebhookEvent) error {
 			}
 
 			detailJson, _ := json.Marshal(detail)
-			_, _ = DB.NewUpdate().Model(&record).
+			if _, updateErr := DB.NewUpdate().Model(&record).
 				Set("content = ?", string(detailJson)).
 				Set("card_string = ?", card.String()).
 				Set("updated_at = ?", time.Now()).
 				Set("feishu_message_id = ?", record.FeishuMessageID).
 				Set("parent_msg_id = ?", record.ParentMsgID).
-				WherePK().Exec(ctx)
+				WherePK().Exec(ctx); updateErr != nil {
+				return updateErr
+			}
+			if parentMsgID != "" {
+				clearParentCardCI(ctx, parentMsgID)
+			}
 
 			slog.Info("Workflow card updated", "github_id", githubID, "event_type", event.EventType)
 			return nil

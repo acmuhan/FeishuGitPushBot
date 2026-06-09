@@ -42,6 +42,18 @@ func TestRenderCIStatusLifecycleStates(t *testing.T) {
 	assert.Equal(t, "✅ CI **passed**", got[3])
 }
 
+func TestRenderCIStatusUnknownConclusionIsNotSuccess(t *testing.T) {
+	statuses := []CIStatus{
+		{WorkflowName: "CI", Status: "completed", Conclusion: "startup_failure", RunID: 12345},
+	}
+	got := renderCIStatuses(statuses, "https://github.com/test/repo")
+
+	assert.Equal(t, "⚠️ CI **startup failure** ([logs](https://github.com/test/repo/actions/runs/12345))", got)
+	assert.NotContains(t, got, "✅")
+	assert.True(t, ciFailed(statuses))
+	assert.Len(t, makeCIActionButtons(statuses, "https://github.com/test/repo"), 2)
+}
+
 func TestRenderCIStatusGroupsJobsUnderWorkflow(t *testing.T) {
 	got := renderCIStatuses([]CIStatus{
 		{
@@ -71,6 +83,25 @@ func TestRenderCIStatusGroupsJobsUnderWorkflow(t *testing.T) {
 	assert.Contains(t, got, "↳ ⏳ Code Quality **running**")
 	assert.Contains(t, got, "↳ ✅ Build **passed** (57 seconds)")
 	assert.NotContains(t, got, "J621111")
+}
+
+func TestRenderCIStatusOrdersOrphanJobsDeterministically(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "job:222",
+			JobName:      "Later Run",
+			Status:       "queued",
+			ParentRunID:  200,
+		},
+		{
+			WorkflowName: "job:111",
+			JobName:      "Earlier Run",
+			Status:       "queued",
+			ParentRunID:  100,
+		},
+	}, "")
+
+	assert.Equal(t, "🕒 Earlier Run **queued**<br>🕒 Later Run **queued**", got)
 }
 
 func TestProcessCommitMessageDoesNotBoldConventionalPrefix(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -435,6 +436,9 @@ func ParseEvent(event any, eventType string) EventDetail {
 			return d
 		}
 		status := wr.GetStatus()
+		if status == "" {
+			status = e.GetAction()
+		}
 		conclusion := wr.GetConclusion()
 		workflowName := wr.GetName()
 		ref := wr.GetHeadBranch()
@@ -1587,11 +1591,15 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 			lines = append(lines, renderSingleCIStatus(job, repoURL, true))
 		}
 	}
-	for runKey, jobs := range jobsByRun {
-		if attachedJobRuns[runKey] {
-			continue
+	var unattachedRunKeys []string
+	for runKey := range jobsByRun {
+		if !attachedJobRuns[runKey] {
+			unattachedRunKeys = append(unattachedRunKeys, runKey)
 		}
-		for _, job := range jobs {
+	}
+	sort.Strings(unattachedRunKeys)
+	for _, runKey := range unattachedRunKeys {
+		for _, job := range jobsByRun[runKey] {
 			lines = append(lines, renderSingleCIStatus(job, repoURL, false))
 		}
 	}
@@ -1657,6 +1665,9 @@ func ciStateDisplay(status, conclusion string) (string, string) {
 	case "action_required":
 		return "⚠️", "action required"
 	}
+	if conclusion != "" {
+		return "⚠️", strings.ReplaceAll(conclusion, "_", " ")
+	}
 	switch status {
 	case "requested":
 		return "⚙️", "requested"
@@ -1709,11 +1720,20 @@ func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
 // ciFailed 检查 CI 状态列表中是否有失败的
 func ciFailed(statuses []CIStatus) bool {
 	for _, cs := range statuses {
-		if cs.Conclusion == "failure" || cs.Conclusion == "cancelled" {
+		if ciConclusionNeedsAttention(cs.Conclusion) {
 			return true
 		}
 	}
 	return false
+}
+
+func ciConclusionNeedsAttention(conclusion string) bool {
+	switch conclusion {
+	case "failure", "cancelled", "timed_out", "startup_failure", "action_required":
+		return true
+	default:
+		return false
+	}
 }
 
 // makeCIActionButtons 为失败的 CI 事件生成操作按钮
@@ -1724,7 +1744,7 @@ func makeCIActionButtons(statuses []CIStatus, repoURL string) []ActionButton {
 	var btns []ActionButton
 	seenRuns := make(map[int64]bool)
 	for _, cs := range statuses {
-		if (cs.Conclusion == "failure" || cs.Conclusion == "cancelled") && cs.RunID > 0 && !seenRuns[cs.RunID] {
+		if ciConclusionNeedsAttention(cs.Conclusion) && cs.RunID > 0 && !seenRuns[cs.RunID] {
 			seenRuns[cs.RunID] = true
 			btns = append(btns, ActionButton{
 				Text: fmt.Sprintf("View %s Logs", cs.WorkflowName),

@@ -450,6 +450,34 @@ func intPtr(i int) *int {
 	return &i
 }
 
+func TestParseWorkflowRunUsesActionWhenStatusMissing(t *testing.T) {
+	detail := ParseEvent(&github.WorkflowRunEvent{
+		Action: strPtr("requested"),
+		WorkflowRun: &github.WorkflowRun{
+			ID:         int64Ptr(12345),
+			Name:       strPtr("CI"),
+			HeadBranch: strPtr("main"),
+			HeadSHA:    strPtr("abcdef123456"),
+			HTMLURL:    strPtr("https://github.com/test/repo/actions/runs/12345"),
+			CreatedAt:  tsPtr(time.Date(2026, 6, 9, 7, 0, 0, 0, time.UTC)),
+		},
+		Repo: &github.Repository{
+			FullName: strPtr("test/repo"),
+			HTMLURL:  strPtr("https://github.com/test/repo"),
+		},
+	}, "workflow_run")
+
+	if detail.Title != "⚙️ Workflow Requested: CI" {
+		t.Fatalf("Title = %q", detail.Title)
+	}
+	if strings.Contains(detail.Title, "Started") {
+		t.Fatalf("Title should not fall back to started when action is present: %q", detail.Title)
+	}
+	if !strings.Contains(detail.Text, "requested") {
+		t.Fatalf("Text = %q, want requested state", detail.Text)
+	}
+}
+
 func TestWorkflowRunAttemptHelpers(t *testing.T) {
 	payload := map[string]any{
 		"workflow_run": map[string]any{
