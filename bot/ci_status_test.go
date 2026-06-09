@@ -24,6 +24,22 @@ func TestRenderCIStatusCleansWorkflowTitlePrefix(t *testing.T) {
 	assert.NotContains(t, got, "Workflow Succeeded")
 }
 
+func TestRenderCIStatusCleansCompactWorkflowTitlePrefix(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "✅Workflow Succeeded: Scheduled",
+			Status:       "completed",
+			Conclusion:   "success",
+			RunID:        12345,
+			Duration:     "1 minute 12 seconds",
+		},
+	}, "https://github.com/NCUHOME/putable")
+
+	assert.Contains(t, got, "✅ Scheduled **passed**")
+	assert.NotContains(t, got, "✅ ✅")
+	assert.NotContains(t, got, "Workflow Succeeded")
+}
+
 func TestRenderCIStatusLifecycleStates(t *testing.T) {
 	statuses := []CIStatus{
 		{WorkflowName: "CI", Status: "requested"},

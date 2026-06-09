@@ -278,17 +278,17 @@ func ParseEvent(event any, eventType string) EventDetail {
 			if l := e.GetLabel(); l != nil {
 				label = l.GetName()
 			}
-			d.Text = fmt.Sprintf("**%s**\n\nLabel: `%s`", pr.GetTitle(), label)
+			d.Text = fmt.Sprintf("%s\n\nLabel: `%s`", pr.GetTitle(), label)
 		} else {
 			text, foldable := ProcessGithubMarkdown(pr.GetBody())
 			// 如果内容过长 (比如超过 800 字)，则放入 ExtraReply
 			if len(text) > 30000 {
-				d.Text = fmt.Sprintf("**%s**\n*(Content too long, see reply)*", pr.GetTitle())
+				d.Text = fmt.Sprintf("%s\n*(Content too long, see reply)*", pr.GetTitle())
 				d.ExtraReply = text
 			} else if text != "" {
-				d.Text = fmt.Sprintf("**%s**\n%s", pr.GetTitle(), text)
+				d.Text = fmt.Sprintf("%s\n%s", pr.GetTitle(), text)
 			} else {
-				d.Text = fmt.Sprintf("**%s**", pr.GetTitle())
+				d.Text = pr.GetTitle()
 			}
 			d.FoldableBody = foldable
 		}
@@ -1619,11 +1619,21 @@ func upsertRenderedCIStatus(statuses []CIStatus, status CIStatus) []CIStatus {
 
 func cleanCIStatusDisplayName(name string) string {
 	name = strings.TrimSpace(name)
-	name = strings.TrimPrefix(name, "✅ ")
-	name = strings.TrimPrefix(name, "❌ ")
-	name = strings.TrimPrefix(name, "⏳ ")
-	name = strings.TrimPrefix(name, "⚙️ ")
-	name = strings.TrimPrefix(name, "🚫 ")
+	for {
+		trimmed := strings.TrimSpace(name)
+		next := trimmed
+		for _, icon := range []string{"✅", "❌", "⏳", "⚙️", "🚫", "🕒", "⏭️", "➖", "⚠️"} {
+			if strings.HasPrefix(next, icon) {
+				next = strings.TrimSpace(strings.TrimPrefix(next, icon))
+				break
+			}
+		}
+		if next == trimmed {
+			name = trimmed
+			break
+		}
+		name = next
+	}
 	for _, prefix := range []string{
 		"Workflow Succeeded: ",
 		"Workflow Failed: ",
@@ -2419,6 +2429,8 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 	}
 
 	// 1. 预处理 Mermaid
+	s = strings.ReplaceAll(s, `\r\n`, "\n")
+	s = strings.ReplaceAll(s, `\n`, "\n")
 	s = strings.ReplaceAll(s, "```mermaid", "```")
 
 	// 2. 提取 <details> <summary> 折叠内容
