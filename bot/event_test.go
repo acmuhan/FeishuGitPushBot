@@ -478,6 +478,50 @@ func TestParseWorkflowRunUsesActionWhenStatusMissing(t *testing.T) {
 	}
 }
 
+func TestParsePullRequestNormalizesLiteralNewlinesAndPlainTitle(t *testing.T) {
+	detail := ParseEvent(&github.PullRequestEvent{
+		Action: strPtr("opened"),
+		PullRequest: &github.PullRequest{
+			Title:   strPtr("feat: 通知功能基础实现"),
+			Body:    strPtr(`Summary\n- 为帖子点赞和评论创建通知\n- 首页增加未读通知入口\n\n## Verification\n- npm run typecheck\n- npm run lint\n- npm run build`),
+			HTMLURL: strPtr("https://github.com/NCUHOME/youth-pen/pull/1"),
+			Head: &github.PullRequestBranch{
+				Ref: strPtr("feat/notifications"),
+				Repo: &github.Repository{
+					HTMLURL: strPtr("https://github.com/NCUHOME/youth-pen"),
+				},
+			},
+			Base: &github.PullRequestBranch{Ref: strPtr("main")},
+			User: &github.User{
+				Login:     strPtr("J621111"),
+				HTMLURL:   strPtr("https://github.com/J621111"),
+				AvatarURL: strPtr("https://avatars.githubusercontent.com/u/1"),
+			},
+			CreatedAt: tsPtr(time.Date(2026, 6, 9, 11, 30, 15, 0, time.UTC)),
+		},
+		Repo: &github.Repository{
+			FullName: strPtr("NCUHOME/youth-pen"),
+			HTMLURL:  strPtr("https://github.com/NCUHOME/youth-pen"),
+		},
+	}, "pull_request")
+
+	if detail.Text == "" {
+		t.Fatal("Text is empty")
+	}
+	if strings.Contains(detail.Text, `\n`) {
+		t.Fatalf("Text still contains literal newline escapes: %q", detail.Text)
+	}
+	if strings.Contains(detail.Text, "**feat: 通知功能基础实现**") {
+		t.Fatalf("PR title should not be wrapped in bold markdown: %q", detail.Text)
+	}
+	if !strings.Contains(detail.Text, "Summary\n- 为帖子点赞和评论创建通知") {
+		t.Fatalf("Text did not normalize summary list: %q", detail.Text)
+	}
+	if !strings.Contains(detail.Text, "## Verification\n- npm run typecheck") {
+		t.Fatalf("Text did not preserve markdown section/list: %q", detail.Text)
+	}
+}
+
 func TestWorkflowRunAttemptHelpers(t *testing.T) {
 	payload := map[string]any{
 		"workflow_run": map[string]any{
