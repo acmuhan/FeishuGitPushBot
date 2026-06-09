@@ -538,6 +538,35 @@ func TestEscapeSQLLikePattern(t *testing.T) {
 	}
 }
 
+func TestSetCIStatusForWorkflowRunUsesWorkflowName(t *testing.T) {
+	payload := map[string]any{
+		"action": "requested",
+		"workflow_run": map[string]any{
+			"id":     float64(12345),
+			"name":   "CI",
+			"status": "requested",
+		},
+	}
+	status, conclusion := extractCIStatus(payload, "workflow_run")
+	detail := EventDetail{
+		Title:     "⚙️ Workflow Requested: CI",
+		EventTime: "2026-06-09T07:00:00Z",
+	}
+
+	setCIStatusForWorkflowRun(payload, &detail, status, conclusion, "main")
+
+	if len(detail.CIStatuses) != 1 {
+		t.Fatalf("CIStatuses len = %d", len(detail.CIStatuses))
+	}
+	got := detail.CIStatuses[0]
+	if got.WorkflowName != "CI" {
+		t.Fatalf("WorkflowName = %q", got.WorkflowName)
+	}
+	if got.Status != "requested" {
+		t.Fatalf("Status = %q", got.Status)
+	}
+}
+
 func TestSendNewEventTypeCards(t *testing.T) {
 	LoadConfig()
 	InitDB()

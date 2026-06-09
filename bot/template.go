@@ -442,25 +442,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 			shortSHA = sha[:7]
 		}
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			if conclusion == "failure" {
-				stateVerb = "failed"
-			} else {
-				stateVerb = conclusion
-			}
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.SHA = shortSHA
 		d.FullSHA = sha
@@ -518,21 +500,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.SHA = shortSHA
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			stateVerb = conclusion
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.Title = fmt.Sprintf("%s Job %s: %s", icon, titleCase(stateVerb), jobName)
 
@@ -586,21 +554,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.SHA = shortSHA
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			stateVerb = conclusion
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.Title = fmt.Sprintf("%s Check: %s", icon, name)
 		d.Text = fmt.Sprintf("%s check **%s** %s", icon, name, stateVerb)
@@ -622,21 +576,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		d.SHA = shortSHA
 
-		icon := "⚙️"
-		stateVerb := "started"
-		switch conclusion {
-		case "success":
-			icon = "✅"
-			stateVerb = "succeeded"
-		case "failure", "cancelled", "timed_out":
-			icon = "❌"
-			stateVerb = conclusion
-		default:
-			if status == "in_progress" {
-				icon = "⏳"
-				stateVerb = "running"
-			}
-		}
+		icon, stateVerb := ciStateDisplay(status, conclusion)
 
 		d.Title = fmt.Sprintf("%s Check Suite %s", icon, titleCase(stateVerb))
 		d.Text = fmt.Sprintf("%s check suite %s", icon, stateVerb)
@@ -1562,30 +1502,27 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 		jobs     []CIStatus
 	}
 	var groups []workflowGroup
-	workflowMap := make(map[string]*workflowGroup)
+	jobsByRun := make(map[string][]CIStatus)
 
 	for _, cs := range statuses {
 		if strings.HasPrefix(cs.WorkflowName, "job:") {
-			// job 条目：提取 parent_run_id 关联到 workflow
 			if cs.ParentRunID > 0 {
 				key := fmt.Sprintf("%d", cs.ParentRunID)
-				if g, ok := workflowMap[key]; ok {
-					g.jobs = append(g.jobs, cs)
-				}
+				jobsByRun[key] = upsertRenderedCIStatus(jobsByRun[key], cs)
 			}
 		} else {
 			// workflow 条目
-			key := fmt.Sprintf("%d", cs.RunID)
 			g := workflowGroup{workflow: cs}
-			workflowMap[key] = &g
 			groups = append(groups, g)
 		}
 	}
+	attachedJobRuns := make(map[string]bool)
 	// 更新 groups 中的 jobs
 	for i := range groups {
 		key := fmt.Sprintf("%d", groups[i].workflow.RunID)
-		if g, ok := workflowMap[key]; ok {
-			groups[i].jobs = g.jobs
+		if jobs, ok := jobsByRun[key]; ok {
+			groups[i].jobs = jobs
+			attachedJobRuns[key] = true
 		}
 	}
 
@@ -1596,30 +1533,102 @@ func renderCIStatuses(statuses []CIStatus, repoURL string) string {
 			lines = append(lines, renderSingleCIStatus(job, repoURL, true))
 		}
 	}
+	for runKey, jobs := range jobsByRun {
+		if attachedJobRuns[runKey] {
+			continue
+		}
+		for _, job := range jobs {
+			lines = append(lines, renderSingleCIStatus(job, repoURL, false))
+		}
+	}
 	return strings.Join(lines, "<br>")
+}
+
+func upsertRenderedCIStatus(statuses []CIStatus, status CIStatus) []CIStatus {
+	key := status.WorkflowName
+	for i, existing := range statuses {
+		if existing.WorkflowName == key {
+			statuses[i] = status
+			return statuses
+		}
+	}
+	return append(statuses, status)
+}
+
+func cleanCIStatusDisplayName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "✅ ")
+	name = strings.TrimPrefix(name, "❌ ")
+	name = strings.TrimPrefix(name, "⏳ ")
+	name = strings.TrimPrefix(name, "⚙️ ")
+	name = strings.TrimPrefix(name, "🚫 ")
+	for _, prefix := range []string{
+		"Workflow Succeeded: ",
+		"Workflow Failed: ",
+		"Workflow Running: ",
+		"Workflow Started: ",
+		"Workflow Requested: ",
+		"Workflow Queued: ",
+		"Workflow Waiting: ",
+		"Workflow Completed: ",
+		"Workflow Cancelled: ",
+		"Workflow Timed_out: ",
+		"Workflow Timed Out: ",
+		"Workflow Neutral: ",
+		"Workflow Skipped: ",
+		"Workflow Action_required: ",
+		"Workflow Action Required: ",
+	} {
+		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
+			return strings.TrimSpace(name[len(prefix):])
+		}
+	}
+	return name
+}
+
+func ciStateDisplay(status, conclusion string) (string, string) {
+	switch conclusion {
+	case "success":
+		return "✅", "succeeded"
+	case "failure":
+		return "❌", "failed"
+	case "cancelled":
+		return "🚫", "cancelled"
+	case "timed_out":
+		return "❌", "timed out"
+	case "skipped":
+		return "⏭️", "skipped"
+	case "neutral":
+		return "➖", "neutral"
+	case "action_required":
+		return "⚠️", "action required"
+	}
+	switch status {
+	case "requested":
+		return "⚙️", "requested"
+	case "queued":
+		return "🕒", "queued"
+	case "waiting":
+		return "🕒", "waiting"
+	case "pending":
+		return "🕒", "pending"
+	case "in_progress":
+		return "⏳", "running"
+	case "completed":
+		return "✅", "completed"
+	default:
+		if status != "" {
+			return "⚙️", status
+		}
+		return "⚙️", "started"
+	}
 }
 
 // renderSingleCIStatus 渲染单条 CI 状态
 func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
-	icon := "⏳"
-	statusText := cs.Status
-	switch cs.Conclusion {
-	case "success":
-		icon = "✅"
+	icon, statusText := ciStateDisplay(cs.Status, cs.Conclusion)
+	if cs.Conclusion == "success" {
 		statusText = "passed"
-	case "failure":
-		icon = "❌"
-		statusText = "failed"
-	case "cancelled":
-		icon = "🚫"
-		statusText = "cancelled"
-	default:
-		if cs.Status == "in_progress" {
-			statusText = "running"
-		} else if cs.Status == "queued" || cs.Status == "waiting" {
-			icon = "⏳"
-			statusText = "pending"
-		}
 	}
 	durationPart := ""
 	if cs.Duration != "" {
@@ -1635,9 +1644,10 @@ func renderSingleCIStatus(cs CIStatus, repoURL string, isJob bool) string {
 	if strings.HasPrefix(displayName, "job:") {
 		displayName = cs.JobName // 使用存储的 job 名称
 	}
+	displayName = cleanCIStatusDisplayName(displayName)
 
 	if isJob {
-		return fmt.Sprintf("    %s %s **%s**%s", icon, displayName, statusText, durationPart)
+		return fmt.Sprintf("↳ %s %s **%s**%s", icon, displayName, statusText, durationPart)
 	}
 	return fmt.Sprintf("%s %s **%s**%s%s", icon, displayName, statusText, durationPart, runLink)
 }
