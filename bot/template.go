@@ -462,6 +462,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 
 		d.SHA = shortSHA
+		d.FullSHA = sha
 		repoUrl := ""
 		if repo := e.GetRepo(); repo != nil {
 			repoUrl = repo.GetHTMLURL()
@@ -469,7 +470,11 @@ func ParseEvent(event any, eventType string) EventDetail {
 		if repoUrl != "" && ref != "" {
 			d.RefURL = fmt.Sprintf("%s/tree/%s", repoUrl, ref)
 		}
-		d.Title = fmt.Sprintf("%s Workflow %s: %s", icon, titleCase(stateVerb), workflowName)
+		titleWorkflowName := workflowName
+		if attempt := wr.GetRunAttempt(); attempt > 1 {
+			titleWorkflowName = fmt.Sprintf("%s (attempt #%d)", workflowName, attempt)
+		}
+		d.Title = fmt.Sprintf("%s Workflow %s: %s", icon, titleCase(stateVerb), titleWorkflowName)
 
 		var lines []string
 		durationPart := ""
@@ -484,7 +489,11 @@ func ParseEvent(event any, eventType string) EventDetail {
 				}
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%s **%s** workflow run %s%s", icon, workflowName, stateVerb, durationPart))
+		attemptPart := ""
+		if attempt := wr.GetRunAttempt(); attempt > 1 {
+			attemptPart = fmt.Sprintf(" (attempt #%d)", attempt)
+		}
+		lines = append(lines, fmt.Sprintf("%s **%s** workflow run %s%s%s", icon, workflowName, stateVerb, durationPart, attemptPart))
 
 		d.Text = strings.Join(lines, "\n")
 		d.RefName = ref

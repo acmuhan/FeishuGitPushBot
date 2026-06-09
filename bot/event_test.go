@@ -449,6 +449,49 @@ func intPtr(i int) *int {
 	return &i
 }
 
+func TestWorkflowRunAttemptHelpers(t *testing.T) {
+	payload := map[string]any{
+		"workflow_run": map[string]any{
+			"id":          float64(12345),
+			"run_attempt": float64(2),
+			"triggering_actor": map[string]any{
+				"login":      "rerun-user",
+				"html_url":   "https://github.com/rerun-user",
+				"avatar_url": "https://avatars.githubusercontent.com/u/2",
+			},
+		},
+	}
+
+	if got := workflowRunBaseID(payload); got != "wf:12345" {
+		t.Fatalf("workflowRunBaseID() = %q", got)
+	}
+	if got := workflowRunAttemptID(payload); got != "wf:12345:attempt:2" {
+		t.Fatalf("workflowRunAttemptID() = %q", got)
+	}
+
+	sender, senderURL, avatarURL := applyWorkflowTriggeringActor(
+		payload,
+		"github-actions[bot]",
+		"https://github.com/apps/github-actions",
+		"https://avatars.githubusercontent.com/in/15368",
+	)
+	if sender != "rerun-user" || senderURL != "https://github.com/rerun-user" || avatarURL != "https://avatars.githubusercontent.com/u/2" {
+		t.Fatalf("triggering actor not applied: sender=%q url=%q avatar=%q", sender, senderURL, avatarURL)
+	}
+}
+
+func TestWorkflowRunAttemptIDDefaultsToBaseID(t *testing.T) {
+	payload := map[string]any{
+		"workflow_run": map[string]any{
+			"id": float64(12345),
+		},
+	}
+
+	if got := workflowRunAttemptID(payload); got != "wf:12345" {
+		t.Fatalf("workflowRunAttemptID() = %q", got)
+	}
+}
+
 func TestSendNewEventTypeCards(t *testing.T) {
 	LoadConfig()
 	InitDB()

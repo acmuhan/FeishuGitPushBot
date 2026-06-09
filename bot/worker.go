@@ -211,6 +211,212 @@ func extractCIStatus(m map[string]any, eventType string) (status, conclusion str
 	return "", ""
 }
 
+func isCIEventType(eventType string) bool {
+	return eventType == "workflow_run" ||
+		eventType == "workflow_job" ||
+		eventType == "check_run" ||
+		eventType == "check_suite"
+}
+
+func workflowRunAttempt(m map[string]any) int {
+	attemptStr := ext(m, "workflow_run", "run_attempt")
+	if attemptStr == "" {
+		return 1
+	}
+	attempt, err := strconv.Atoi(attemptStr)
+	if err != nil || attempt <= 0 {
+		return 1
+	}
+	return attempt
+}
+
+func workflowRunBaseID(m map[string]any) string {
+	runID := ext(m, "workflow_run", "id")
+	if runID == "" {
+		return ""
+	}
+	return "wf:" + runID
+}
+
+func workflowRunAttemptID(m map[string]any) string {
+	baseID := workflowRunBaseID(m)
+	if baseID == "" {
+		return ""
+	}
+	attempt := workflowRunAttempt(m)
+	if attempt <= 1 {
+		return baseID
+	}
+	return fmt.Sprintf("%s:attempt:%d", baseID, attempt)
+}
+
+func applyWorkflowTriggeringActor(m map[string]any, sender, senderUrl, avatarUrl string) (string, string, string) {
+	login := ext(m, "workflow_run", "triggering_actor", "login")
+	if login == "" {
+		return sender, senderUrl, avatarUrl
+	}
+	if htmlURL := ext(m, "workflow_run", "triggering_actor", "html_url"); htmlURL != "" {
+		senderUrl = htmlURL
+	}
+	if avatar := ext(m, "workflow_run", "triggering_actor", "avatar_url"); avatar != "" {
+		avatarUrl = avatar
+	}
+	return login, senderUrl, avatarUrl
+}
+
+func setCIStatusForWorkflowRun(m map[string]any, detail *EventDetail, status, conclusion, ref string) {
+	ciStatus := CIStatus{
+		WorkflowName: detail.Title,
+		Status:       status,
+		Conclusion:   conclusion,
+		Ref:          ref,
+		UpdatedAt:    detail.EventTime,
+	}
+	ciStatus.RunID, _ = strconv.ParseInt(ext(m, "workflow_run", "id"), 10, 64)
+	if conclusion != "" {
+		ciStatus.Duration = workflowRunDuration(m)
+	}
+	detail.CIStatuses = []CIStatus{ciStatus}
+}
+
+func findMessageRecordByGithubID(ctx context.Context, githubID string) *MessageRecord {
+	if githubID == "" || DB == nil {
+		return nil
+	}
+	var record MessageRecord
+	if err := DB.NewSelect().Model(&record).
+		Where("github_id = ?", githubID).
+		Order("id DESC").
+		Limit(1).Scan(ctx); err == nil {
+		return &record
+	}
+	return nil
+}
+
+func findPreviousWorkflowRunRecord(ctx context.Context, repo, baseID, currentID string) *MessageRecord {
+	if repo == "" || baseID == "" || DB == nil {
+		return nil
+	}
+	var record MessageRecord
+	if err := DB.NewSelect().Model(&record).
+		Where("repo_name = ?", repo).
+		Where("event_type = ?", "workflow_run").
+		Where("github_id != ?", currentID).
+		Where("(github_id = ? OR github_id LIKE ?)", baseID, baseID+":attempt:%").
+		Order("updated_at DESC").
+		Order("id DESC").
+		Limit(1).Scan(ctx); err == nil {
+		return &record
+	}
+	return nil
+}
+
+func updateWorkflowRunRecord(
+	ctx context.Context,
+	record *MessageRecord,
+	newGithubID string,
+	event WebhookEvent,
+	m map[string]any,
+	detail EventDetail,
+	repo, sender, senderUrl, avatarUrl, ref, sha string,
+) error {
+	if record == nil {
+		return nil
+	}
+	status, conclusion := extractCIStatus(m, event.EventType)
+	setCIStatusForWorkflowRun(m, &detail, status, conclusion, ref)
+
+	if conclusion != "" && record.TimeoutNotified {
+		_, _ = DB.NewUpdate().Model(record).
+			Set("timeout_notified = ?", false).
+			WherePK().Exec(ctx)
+	}
+	if conclusion == "" && status == "in_progress" &&
+		!record.WorkflowStartedAt.IsZero() &&
+		time.Since(record.WorkflowStartedAt) > 10*time.Minute &&
+		!record.TimeoutNotified {
+		sendTimeoutNotification(record.FeishuMessageID, detail.Title, record.WorkflowStartedAt)
+		_, _ = DB.NewUpdate().Model(record).
+			Set("timeout_notified = ?", true).
+			WherePK().Exec(ctx)
+	}
+
+	workflowStartedAt := record.WorkflowStartedAt
+	if status == "in_progress" && conclusion == "" {
+		workflowStartedAt = time.Now()
+	}
+	detailJson, _ := json.Marshal(detail)
+
+	updateQ := DB.NewUpdate().Model(record).
+		Set("content = ?", string(detailJson)).
+		Set("event_id = ?", event.ID).
+		Set("workflow_started_at = ?", workflowStartedAt).
+		Set("head_sha = ?", sha).
+		Set("sender = ?", sender).
+		Set("sender_url = ?", senderUrl).
+		Set("avatar_url2 = ?", avatarUrl).
+		Set("updated_at = ?", time.Now()).
+		WherePK()
+	if newGithubID != "" && newGithubID != record.GithubID {
+		updateQ = updateQ.Set("github_id = ?", newGithubID)
+	}
+
+	if record.ParentMsgID != "" {
+		if _, err := updateQ.Exec(ctx); err != nil {
+			return err
+		}
+		updateParentCardWithCI(ctx, record.ParentMsgID)
+		return nil
+	}
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+	card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
+	buildCancel()
+	if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
+		return err
+	}
+	_, err := updateQ.Set("card_string = ?", card.String()).Exec(ctx)
+	return err
+}
+
+func tryUpdatePreviousWorkflowRunMessage(
+	ctx context.Context,
+	record *MessageRecord,
+	event WebhookEvent,
+	m map[string]any,
+	detail EventDetail,
+	repo, sender, senderUrl, avatarUrl, ref, sha string,
+) {
+	if record == nil {
+		return
+	}
+	if err := updateWorkflowRunRecord(ctx, record, "", event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha); err != nil {
+		slog.Warn("Failed to update previous workflow message after rerun",
+			"github_id", record.GithubID,
+			"message_id", record.FeishuMessageID,
+			"error", err)
+		return
+	}
+	slog.Info("Previous workflow message updated after rerun", "github_id", record.GithubID, "message_id", record.FeishuMessageID)
+}
+
+func workflowRunDuration(m map[string]any) string {
+	startedAtStr := ext(m, "workflow_run", "run_started_at")
+	updatedAtStr := ext(m, "workflow_run", "updated_at")
+	if startedAtStr == "" || updatedAtStr == "" {
+		return ""
+	}
+	startedAt, err := time.Parse(time.RFC3339, startedAtStr)
+	if err != nil {
+		return ""
+	}
+	updatedAt, err := time.Parse(time.RFC3339, updatedAtStr)
+	if err != nil {
+		return ""
+	}
+	return FormatDuration(updatedAt.Sub(startedAt))
+}
+
 // sendTimeoutNotification 发送 Workflow 超时提醒回复
 func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) {
 	timeoutCard := NewCard()
@@ -402,6 +608,7 @@ func detectPRMerge(ctx context.Context, event WebhookEvent, m map[string]any, de
 func processWebhookEvent(event WebhookEvent) error {
 	ctx := context.Background()
 	var parentMsgID string // CI 事件关联的父消息 ID
+	var previousWorkflowRunRecord *MessageRecord
 
 	// 1. 解析 Payload
 	payload := []byte(event.Payload)
@@ -442,8 +649,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	sender := ext(m, "sender", "login")
 	senderUrl := ext(m, "sender", "html_url")
 	avatarUrl := ext(m, "sender", "avatar_url")
-	detail.RepoName = repo    // 用于合并展示的仓库全名
-	detail.RepoURL = repoUrl  // 用于 BuildCard 构建链接
+	detail.RepoName = repo   // 用于合并展示的仓库全名
+	detail.RepoURL = repoUrl // 用于 BuildCard 构建链接
 	ref := ext(m, "ref")
 	// Workflow 事件的 ref 在 head_branch 中
 	if ref == "" {
@@ -451,6 +658,10 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 	if ref == "" {
 		ref = ext(m, "workflow_job", "head_branch")
+	}
+	isCIEvent := isCIEventType(event.EventType)
+	if event.EventType == "workflow_run" {
+		sender, senderUrl, avatarUrl = applyWorkflowTriggeringActor(m, sender, senderUrl, avatarUrl)
 	}
 
 	// 检查是否为 Bot 用户
@@ -467,7 +678,8 @@ func processWebhookEvent(event WebhookEvent) error {
 			event.EventType == "pull_request_review" ||
 			event.EventType == "pull_request_review_comment" ||
 			event.EventType == "issue_comment" ||
-			event.EventType == "issues"
+			event.EventType == "issues" ||
+			isCIEvent
 		if !isBotAllowed {
 			slog.Info("Bot user event skipped", "sender", sender, "event", event.EventType)
 			return nil
@@ -515,7 +727,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	var githubID string
 	switch event.EventType {
 	case "workflow_run":
-		githubID = "wf:" + ext(m, "workflow_run", "id")
+		githubID = workflowRunAttemptID(m)
 	case "workflow_job":
 		// 每个 Job 使用独立 ID 追踪，避免覆盖 workflow_run 或其他 job 的记录
 		githubID = "wfjob:" + ext(m, "workflow_job", "id")
@@ -613,7 +825,8 @@ func processWebhookEvent(event WebhookEvent) error {
 		event.EventType != "create" &&
 		event.EventType != "delete" &&
 		event.EventType != "issue_comment" &&
-		event.EventType != "pull_request_review_comment"
+		event.EventType != "pull_request_review_comment" &&
+		!isCIEvent
 
 	if needDedup {
 		if tryDedup(ctx, githubID, event.EventType, &detail) {
@@ -623,10 +836,33 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	// 4. 合并与更新逻辑
 	// 4.1 CI/CD 事件 (Workflow, Check Run)：更新同一条消息，支持超时提醒
-	isCIEvent := event.EventType == "workflow_run" ||
-		event.EventType == "workflow_job" ||
-		event.EventType == "check_run" ||
-		event.EventType == "check_suite"
+	if event.EventType == "workflow_run" && githubID != "" {
+		status, conclusion := extractCIStatus(m, event.EventType)
+		setCIStatusForWorkflowRun(m, &detail, status, conclusion, ref)
+
+		if record := findMessageRecordByGithubID(ctx, githubID); record != nil {
+			if err := updateWorkflowRunRecord(ctx, record, "", event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha); err != nil {
+				return fmt.Errorf("failed to update workflow run message: %w", err)
+			}
+			if previous := findPreviousWorkflowRunRecord(ctx, repo, workflowRunBaseID(m), githubID); previous != nil && previous.FeishuMessageID != record.FeishuMessageID {
+				tryUpdatePreviousWorkflowRunMessage(ctx, previous, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha)
+			}
+			slog.Info("Workflow run attempt updated", "github_id", githubID, "attempt", workflowRunAttempt(m))
+			return nil
+		}
+
+		previousWorkflowRunRecord = findPreviousWorkflowRunRecord(ctx, repo, workflowRunBaseID(m), githubID)
+		if previousWorkflowRunRecord != nil {
+			if time.Since(previousWorkflowRunRecord.UpdatedAt) <= getMergeWindow() {
+				if err := updateWorkflowRunRecord(ctx, previousWorkflowRunRecord, githubID, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha); err != nil {
+					return fmt.Errorf("failed to update workflow rerun within merge window: %w", err)
+				}
+				slog.Info("Workflow rerun updated within merge window", "old_github_id", previousWorkflowRunRecord.GithubID, "new_github_id", githubID, "attempt", workflowRunAttempt(m))
+				return nil
+			}
+			slog.Info("Workflow rerun outside merge window, creating new message", "old_github_id", previousWorkflowRunRecord.GithubID, "new_github_id", githubID, "attempt", workflowRunAttempt(m))
+		}
+	}
 
 	if isCIEvent && githubID != "" {
 		var record MessageRecord
@@ -1126,7 +1362,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// 4.8 CI 事件无父消息时的处理：in_progress 静默丢弃，仅 completed/failed 创建独立消息
-	if isCIEvent && parentMsgID == "" {
+	if isCIEvent && parentMsgID == "" && !(event.EventType == "workflow_run" && previousWorkflowRunRecord != nil) {
 		status, _ := extractCIStatus(m, event.EventType)
 		if status == "in_progress" || status == "queued" || status == "waiting" {
 			slog.Info("CI event suppressed (no parent, in_progress)", "github_id", githubID, "status", status)
@@ -1135,7 +1371,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// 4.9 CI 事件合并：同一 commit 的多个 workflow 合并显示（仅在合并窗口内）
-	if isCIEvent && parentMsgID == "" && sha != "" {
+	if isCIEvent && parentMsgID == "" && sha != "" && !(event.EventType == "workflow_run" && previousWorkflowRunRecord != nil) {
 		var existingCIRecord MessageRecord
 		if err := DB.NewSelect().Model(&existingCIRecord).
 			Where("event_type IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
@@ -1303,7 +1539,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// Bot 用户的事件必须找到父消息才发送，否则跳过
-	if isBotUser && parentID == "" {
+	if isBotUser && parentID == "" && !isCIEvent {
 		slog.Info("Bot user event skipped: no parent message found", "sender", sender, "event", event.EventType)
 		return nil
 	}
@@ -1388,6 +1624,9 @@ func processWebhookEvent(event WebhookEvent) error {
 			headSHA = sha
 			slog.Info("Storing head_sha for event", "event_type", event.EventType, "head_sha", headSHA, "repo", repo)
 		}
+		if isCIEvent {
+			headSHA = sha
+		}
 
 		// 删除事件标记 record_type，用于合并查询
 		recordType := "normal"
@@ -1424,6 +1663,9 @@ func processWebhookEvent(event WebhookEvent) error {
 			Exec(ctx)
 		if insertErr != nil {
 			slog.Error("Failed to insert/update message record", "github_id", githubID, "error", insertErr)
+		}
+		if event.EventType == "workflow_run" && previousWorkflowRunRecord != nil && previousWorkflowRunRecord.FeishuMessageID != msgID {
+			tryUpdatePreviousWorkflowRunMessage(ctx, previousWorkflowRunRecord, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha)
 		}
 
 		// push 事件入库后，回填同标签 create 事件的 head_sha（create 可能先于 push 处理）
