@@ -1,7 +1,9 @@
 package bot
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -69,4 +71,34 @@ func TestRenderCIStatusGroupsJobsUnderWorkflow(t *testing.T) {
 	assert.Contains(t, got, "↳ ⏳ Code Quality **running**")
 	assert.Contains(t, got, "↳ ✅ Build **passed** (57 seconds)")
 	assert.NotContains(t, got, "J621111")
+}
+
+func TestProcessCommitMessageDoesNotBoldConventionalPrefix(t *testing.T) {
+	got := ProcessCommitMessage("docs:add weekly manual report", "")
+
+	assert.Equal(t, "docs: add weekly manual report", got)
+	assert.NotContains(t, got, "**docs:**")
+}
+
+func TestBranchPushUsesDividerBetweenMergedPushes(t *testing.T) {
+	detail := EventDetail{
+		Title:         "🍏 Branch Push",
+		RefName:       "feat/controlpanel",
+		RepoName:      "NCUHOME/NCU_Medical_Agent",
+		RepoURL:       "https://github.com/NCUHOME/NCU_Medical_Agent",
+		Text:          "🔸 docs: add weekly manual report ([f6754ed](https://github.com/NCUHOME/NCU_Medical_Agent/commit/f6754ed))" + pushGroupSeparator + "🔸 chore: capture workflow artifacts and updates ([3437a98](https://github.com/NCUHOME/NCU_Medical_Agent/commit/3437a98))",
+		Action:        "push",
+		CommitCount:   2,
+		EventTime:     time.Now().Format(time.RFC3339),
+		EventTimeEnd:  time.Now().Format(time.RFC3339),
+		AuthorLogins:  []string{"NEKO-CwC"},
+		AuthorAvatars: []string{"https://avatars.githubusercontent.com/NEKO-CwC"},
+	}
+
+	card := BuildCard(context.Background(), detail.RepoName, "NEKO-CwC", "https://github.com/NEKO-CwC", "", detail)
+	cardJSON := card.String()
+
+	assert.Contains(t, cardJSON, `"tag":"hr"`)
+	assert.NotContains(t, cardJSON, "\\n---\\n")
+	assert.NotContains(t, cardJSON, "**docs:**")
 }

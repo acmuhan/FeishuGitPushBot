@@ -58,6 +58,8 @@ type CIStatus struct {
 	ParentRunID int64  `json:"parent_run_id,omitempty"` // 关联的 workflow run ID
 }
 
+const pushGroupSeparator = "\n---\n"
+
 // ParseEvent 解析 GitHub 事件为极简明了的 Detail
 func ParseEvent(event any, eventType string) EventDetail {
 	d := EventDetail{
@@ -1321,6 +1323,58 @@ func splitCommits(text string) []string {
 	return commits
 }
 
+func splitPushTextGroups(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "<br>---<br>", pushGroupSeparator)
+	parts := strings.Split(text, pushGroupSeparator)
+	var groups []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			groups = append(groups, part)
+		}
+	}
+	return groups
+}
+
+func addPushMarkdown(card *Card, detail EventDetail) {
+	addGroup := func(text string) {
+		commits := splitCommits(text)
+		if len(commits) > 3 {
+			visible := strings.Join(commits[:3], "<br>")
+			remaining := strings.Join(commits[3:], "<br>")
+			card.AddMarkdown(visible)
+			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
+			return
+		}
+		card.AddMarkdown(text)
+	}
+
+	groups := splitPushTextGroups(detail.Text)
+	if len(groups) > 1 {
+		for i, group := range groups {
+			if i > 0 {
+				card.AddDivider()
+			}
+			addGroup(group)
+		}
+		return
+	}
+
+	commitCount := detail.CommitCount
+	if commitCount == 0 {
+		commitCount = detail.EventCount
+	}
+	if commitCount > 3 {
+		commits := splitCommits(detail.Text)
+		if len(commits) > 3 {
+			addGroup(detail.Text)
+			return
+		}
+	}
+	card.AddMarkdown(detail.Text)
+}
+
 // titleCase 将字符串首字母大写（替代已废弃的 strings.Title）
 func titleCase(s string) string {
 	if s == "" {
@@ -1906,17 +1960,8 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		// 有结构化 CI 数据时跳过 detail.Text（避免 workflow 状态重复显示）
 		hasCI := len(detail.CIStatuses) > 0
 		if detail.Text != "" && !hasCI {
-			// Push 事件：超过 3 条 commit 时按 commit 折叠
-			commitCount := detail.CommitCount
-			if commitCount == 0 {
-				commitCount = detail.EventCount
-			}
-			if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
-				commits := splitCommits(detail.Text)
-				visible := strings.Join(commits[:3], "<br>")
-				remaining := strings.Join(commits[3:], "<br>")
-				card.AddMarkdown(visible)
-				card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
+			if detail.Action == "push" && !detail.IsDeleted {
+				addPushMarkdown(card, detail)
 			} else {
 				card.AddMarkdown(detail.Text)
 			}
@@ -2149,18 +2194,18 @@ func containsMarkdownList(s string) bool {
 	return markdownListRe.MatchString(s)
 }
 
-// ProcessCommitMessage 处理提交信息，转换 emoji、高亮 Conventional Commit 前缀，并转换 SHA/Issue 为链接
+// ProcessCommitMessage 处理提交信息，转换 emoji、规范 Conventional Commit 前缀空格，并转换 SHA/Issue 为链接
 func ProcessCommitMessage(msg string, repoUrl string) string {
 	msg = strings.TrimSpace(msg)
 	// 1. 转换 Emoji 短代码
 	msg = emoji.Sprint(msg)
 
-	// 2. 转换 SHA 和 #Issue (在加粗前处理，避免 Markdown 嵌套冲突)
+	// 2. 转换 SHA 和 #Issue
 	if repoUrl != "" {
 		msg = Linkify(msg, repoUrl)
 	}
 
-	// 3. 高亮 Conventional Commit 并处理格式
+	// 3. 规范 Conventional Commit 前缀后的空格
 	matches := conventionalRegex.FindAllStringIndex(msg, -1)
 	if len(matches) == 0 {
 		return msg
@@ -2177,10 +2222,8 @@ func ProcessCommitMessage(msg string, repoUrl string) string {
 			result.WriteString(part)
 		}
 
-		// 加粗匹配的前缀
-		result.WriteString("**")
+		// 保持提交行普通字号，避免飞书将第一条 commit 渲染得过重。
 		result.WriteString(msg[start:end])
-		result.WriteString("**")
 
 		// 确保 prefix 后面有一个空格（解决 feat:xxxx 无法高亮的问题）
 		if end < len(msg) && msg[end] != ' ' && msg[end] != '\n' && msg[end] != '\t' {
