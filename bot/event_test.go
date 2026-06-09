@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,9 +35,9 @@ func TestParseEventNewTypes(t *testing.T) {
 			event: &github.CommitCommentEvent{
 				Action: strPtr("created"),
 				Comment: &github.RepositoryComment{
-					ID:     int64Ptr(12345),
-					Body:   strPtr("This is a commit comment"),
-					HTMLURL: strPtr("https://github.com/test/repo/commit/abc123#commitcomment-12345"),
+					ID:        int64Ptr(12345),
+					Body:      strPtr("This is a commit comment"),
+					HTMLURL:   strPtr("https://github.com/test/repo/commit/abc123#commitcomment-12345"),
 					CreatedAt: &github.Timestamp{Time: now},
 				},
 				Repo: &github.Repository{
@@ -291,12 +292,12 @@ func TestParseEventNewTypes(t *testing.T) {
 			event: &github.CodeScanningAlertEvent{
 				Action: strPtr("created"),
 				Alert: &github.Alert{
-					Number:        intPtr(42),
-					RuleID:        strPtr("js/unused-variable"),
+					Number:          intPtr(42),
+					RuleID:          strPtr("js/unused-variable"),
 					RuleDescription: strPtr("Unused variable"),
-					RuleSeverity:  strPtr("warning"),
-					HTMLURL:       strPtr("https://github.com/test/repo/security/code-scanning/42"),
-					CreatedAt:     &github.Timestamp{Time: now},
+					RuleSeverity:    strPtr("warning"),
+					HTMLURL:         strPtr("https://github.com/test/repo/security/code-scanning/42"),
+					CreatedAt:       &github.Timestamp{Time: now},
 				},
 				Ref: strPtr("refs/heads/main"),
 				Repo: &github.Repository{
@@ -349,11 +350,11 @@ func TestParseEventNewTypes(t *testing.T) {
 			event: &github.SecretScanningAlertEvent{
 				Action: strPtr("created"),
 				Alert: &github.SecretScanningAlert{
-					Number:              intPtr(8),
-					SecretType:          strPtr("github_pat"),
+					Number:                intPtr(8),
+					SecretType:            strPtr("github_pat"),
 					SecretTypeDisplayName: strPtr("GitHub Personal Access Token"),
-					HTMLURL:             strPtr("https://github.com/test/repo/security/secret-scanning/8"),
-					CreatedAt:           &github.Timestamp{Time: now},
+					HTMLURL:               strPtr("https://github.com/test/repo/security/secret-scanning/8"),
+					CreatedAt:             &github.Timestamp{Time: now},
 				},
 				Repo: &github.Repository{
 					FullName: strPtr("test/repo"),
@@ -447,6 +448,94 @@ func min(a, b int) int {
 
 func intPtr(i int) *int {
 	return &i
+}
+
+func TestWorkflowRunAttemptHelpers(t *testing.T) {
+	payload := map[string]any{
+		"workflow_run": map[string]any{
+			"id":          float64(12345),
+			"run_attempt": float64(2),
+			"triggering_actor": map[string]any{
+				"login":      "rerun-user",
+				"html_url":   "https://github.com/rerun-user",
+				"avatar_url": "https://avatars.githubusercontent.com/u/2",
+			},
+		},
+	}
+
+	if got := workflowRunBaseID(payload); got != "wf:12345" {
+		t.Fatalf("workflowRunBaseID() = %q", got)
+	}
+	if got := workflowRunAttemptID(payload); got != "wf:12345:attempt:2" {
+		t.Fatalf("workflowRunAttemptID() = %q", got)
+	}
+
+	sender, senderURL, avatarURL := applyWorkflowTriggeringActor(
+		payload,
+		"github-actions[bot]",
+		"https://github.com/apps/github-actions",
+		"https://avatars.githubusercontent.com/in/15368",
+	)
+	if sender != "rerun-user" || senderURL != "https://github.com/rerun-user" || avatarURL != "https://avatars.githubusercontent.com/u/2" {
+		t.Fatalf("triggering actor not applied: sender=%q url=%q avatar=%q", sender, senderURL, avatarURL)
+	}
+}
+
+func TestWorkflowRunAttemptIDDefaultsToBaseID(t *testing.T) {
+	payload := map[string]any{
+		"workflow_run": map[string]any{
+			"id": float64(12345),
+		},
+	}
+
+	if got := workflowRunAttemptID(payload); got != "wf:12345" {
+		t.Fatalf("workflowRunAttemptID() = %q", got)
+	}
+}
+
+func TestWorkflowRunAttemptIDSupportsIntegerPayloadValues(t *testing.T) {
+	payload := map[string]any{
+		"workflow_run": map[string]any{
+			"id":          int64(12345),
+			"run_attempt": int64(3),
+		},
+	}
+
+	if got := workflowRunAttemptID(payload); got != "wf:12345:attempt:3" {
+		t.Fatalf("workflowRunAttemptID() = %q", got)
+	}
+}
+
+func TestWorkflowRunRerunNoticeUsesAttemptMetadata(t *testing.T) {
+	payload := map[string]any{
+		"workflow_run": map[string]any{
+			"run_attempt": float64(2),
+			"html_url":    "https://github.com/test/repo/actions/runs/123",
+			"status":      "completed",
+			"conclusion":  "success",
+			"triggering_actor": map[string]any{
+				"login":    "rerun-user",
+				"html_url": "https://github.com/rerun-user",
+			},
+		},
+	}
+
+	got := workflowRunRerunNotice(payload, "github-actions[bot]")
+	want := "🔁 This workflow was rerun as [attempt #2](https://github.com/test/repo/actions/runs/123) by [rerun-user](https://github.com/rerun-user)."
+	if got != want {
+		t.Fatalf("workflowRunRerunNotice() = %q", got)
+	}
+	if strings.Contains(got, "success") || strings.Contains(got, "completed") {
+		t.Fatalf("rerun notice should not contain current attempt status: %q", got)
+	}
+}
+
+func TestEscapeSQLLikePattern(t *testing.T) {
+	got := escapeSQLLikePattern(`wf:12_%\34`)
+	want := `wf:12\_\%\\34`
+	if got != want {
+		t.Fatalf("escapeSQLLikePattern() = %q", got)
+	}
 }
 
 func TestSendNewEventTypeCards(t *testing.T) {

@@ -26,21 +26,22 @@ type EventDetail struct {
 	SHA           string   `json:"sha"`
 	FullSHA       string   `json:"full_sha"` // 完整 SHA，用于构建 commit 链接
 	IsTag         bool     `json:"is_tag"`
-	IsDeleted     bool     `json:"is_deleted"` // 分支/标签删除事件
-	AuthorAvatars []string `json:"author_avatars"` // 提交者或协作者的头像 URL 列表
-	AuthorLogins  []string `json:"author_logins"`  // 提交者或协作者的 login 列表（与 AuthorAvatars 顺序对应）
-	Action        string   `json:"action"`         // 事件具体动作
-	ExtraReply    string   `json:"extra_reply"`    // 需要另起一段话题回复的内容
-	EventTime     string   `json:"event_time"`     // GitHub 事件原始发生时间 (RFC3339)
-	RepoName      string   `json:"repo_name"`      // 仓库全名 (如 NCUHOME/repo)，用于合并展示
-	RepoURL       string   `json:"repo_url"`       // 仓库 HTML URL，用于 BuildCard 构建链接
+	IsDeleted     bool     `json:"is_deleted"`       // 分支/标签删除事件
+	AuthorAvatars []string `json:"author_avatars"`   // 提交者或协作者的头像 URL 列表
+	AuthorLogins  []string `json:"author_logins"`    // 提交者或协作者的 login 列表（与 AuthorAvatars 顺序对应）
+	Action        string   `json:"action"`           // 事件具体动作
+	ExtraReply    string   `json:"extra_reply"`      // 需要另起一段话题回复的内容
+	EventTime     string   `json:"event_time"`       // GitHub 事件原始发生时间 (RFC3339)
+	RepoName      string   `json:"repo_name"`        // 仓库全名 (如 NCUHOME/repo)，用于合并展示
+	RepoURL       string   `json:"repo_url"`         // 仓库 HTML URL，用于 BuildCard 构建链接
+	Notice        string   `json:"notice,omitempty"` // 额外提示，展示在主体内容之后
 
 	// CI 状态：内联到触发事件的卡片中
 	CIStatuses []CIStatus `json:"ci_statuses,omitempty"`
 	// 合并事件：记录时间范围和数量
 	EventTimeEnd string `json:"event_time_end,omitempty"` // 合并事件的最后时间
-	EventCount   int    `json:"event_count,omitempty"`     // 合并事件中的条目数（按 commit 计）
-	CommitCount  int    `json:"commit_count,omitempty"`    // push 事件的 commit 总数（用于折叠）
+	EventCount   int    `json:"event_count,omitempty"`    // 合并事件中的条目数（按 commit 计）
+	CommitCount  int    `json:"commit_count,omitempty"`   // push 事件的 commit 总数（用于折叠）
 }
 
 // CIStatus 单条 CI/Workflow 运行状态
@@ -53,7 +54,7 @@ type CIStatus struct {
 	Duration     string `json:"duration"`      // 格式化后的耗时
 	UpdatedAt    string `json:"updated_at"`    // 最后更新时间 (RFC3339)
 	// Job 专用字段
-	JobName    string `json:"job_name,omitempty"`    // job 名称（用于显示）
+	JobName     string `json:"job_name,omitempty"`      // job 名称（用于显示）
 	ParentRunID int64  `json:"parent_run_id,omitempty"` // 关联的 workflow run ID
 }
 
@@ -462,6 +463,7 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 
 		d.SHA = shortSHA
+		d.FullSHA = sha
 		repoUrl := ""
 		if repo := e.GetRepo(); repo != nil {
 			repoUrl = repo.GetHTMLURL()
@@ -469,7 +471,11 @@ func ParseEvent(event any, eventType string) EventDetail {
 		if repoUrl != "" && ref != "" {
 			d.RefURL = fmt.Sprintf("%s/tree/%s", repoUrl, ref)
 		}
-		d.Title = fmt.Sprintf("%s Workflow %s: %s", icon, titleCase(stateVerb), workflowName)
+		titleWorkflowName := workflowName
+		if attempt := wr.GetRunAttempt(); attempt > 1 {
+			titleWorkflowName = fmt.Sprintf("%s (attempt #%d)", workflowName, attempt)
+		}
+		d.Title = fmt.Sprintf("%s Workflow %s: %s", icon, titleCase(stateVerb), titleWorkflowName)
 
 		var lines []string
 		durationPart := ""
@@ -484,7 +490,11 @@ func ParseEvent(event any, eventType string) EventDetail {
 				}
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%s **%s** workflow run %s%s", icon, workflowName, stateVerb, durationPart))
+		attemptPart := ""
+		if attempt := wr.GetRunAttempt(); attempt > 1 {
+			attemptPart = fmt.Sprintf(" (attempt #%d)", attempt)
+		}
+		lines = append(lines, fmt.Sprintf("%s **%s** workflow run %s%s%s", icon, workflowName, stateVerb, durationPart, attemptPart))
 
 		d.Text = strings.Join(lines, "\n")
 		d.RefName = ref
@@ -1705,8 +1715,8 @@ func buildSummaryRow(metaText, senderText string, resolvedAvatars []string) map[
 	avatarCols := make([]any, 0, len(resolvedAvatars))
 	for _, key := range resolvedAvatars {
 		avatarCols = append(avatarCols, map[string]any{
-			"tag":      "column",
-			"width":    "auto",
+			"tag":   "column",
+			"width": "auto",
 			"elements": []any{map[string]any{
 				"tag":          "img",
 				"img_key":      key,
@@ -1870,69 +1880,72 @@ func BuildCard(ctx context.Context, repo, sender, senderUrl, avatarUrl string, d
 		}
 	} else {
 
-	// 摘要行：仓库+分支 / 头像+用户名
-	if row := buildSummaryRow(metaText, senderText, resolvedAvatars); row != nil {
-		card.Body.Elements = append(card.Body.Elements, row)
-	} else {
-		line := metaText
-		if line != "" {
-			line += " / "
-		}
-		line += "👤 " + senderText
-		card.AddMarkdown(line)
-	}
-
-	// --- 2. 详情内容 ---
-	// 有结构化 CI 数据时跳过 detail.Text（避免 workflow 状态重复显示）
-	hasCI := len(detail.CIStatuses) > 0
-	if detail.Text != "" && !hasCI {
-		// Push 事件：超过 3 条 commit 时按 commit 折叠
-		commitCount := detail.CommitCount
-		if commitCount == 0 {
-			commitCount = detail.EventCount
-		}
-		if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
-			commits := splitCommits(detail.Text)
-			visible := strings.Join(commits[:3], "<br>")
-			remaining := strings.Join(commits[3:], "<br>")
-			card.AddMarkdown(visible)
-			card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
+		// 摘要行：仓库+分支 / 头像+用户名
+		if row := buildSummaryRow(metaText, senderText, resolvedAvatars); row != nil {
+			card.Body.Elements = append(card.Body.Elements, row)
 		} else {
-			card.AddMarkdown(detail.Text)
-		}
-	}
-
-	// --- 2.5 CI 状态（内联到触发事件的卡片）---
-	if ciText := renderCIStatuses(detail.CIStatuses, repoUrl); ciText != "" {
-		card.AddMarkdown(ciText)
-	}
-
-	// --- 3. 可折叠的附加内容（PR body 中的 <details> 块等）---
-	if detail.FoldableBody != "" {
-		card.AddCollapsiblePanel("📝 展开查看详情", detail.FoldableBody)
-	}
-
-	// --- 4. 操作按钮（V2 规范：必须放在 action 容器内）---
-	var btns []ActionButton
-	if ciFailed(detail.CIStatuses) {
-		// CI 失败时只显示 CI 专用按钮，不追加通用 View Details（URL 重复）
-		btns = makeCIActionButtons(detail.CIStatuses, repoUrl)
-	} else {
-		// 非 CI 失败：Push / 删除 / 新建分支等事件不显示详情按钮
-		skipBtn := strings.Contains(detail.Title, "commits") ||
-			strings.Contains(detail.Title, "Deleted") ||
-			strings.Contains(detail.Title, "Created")
-		if detail.URL != "" && !skipBtn {
-			btnType := "primary"
-			if ContainsAny(detail.Title, "❌", "💥") {
-				btnType = "danger"
+			line := metaText
+			if line != "" {
+				line += " / "
 			}
-			btns = append(btns, ActionButton{Text: "View Details", URL: detail.URL, Type: btnType})
+			line += "👤 " + senderText
+			card.AddMarkdown(line)
 		}
-	}
-	if len(btns) > 0 {
-		card.AddActions("flow", btns...)
-	}
+
+		// --- 2. 详情内容 ---
+		// 有结构化 CI 数据时跳过 detail.Text（避免 workflow 状态重复显示）
+		hasCI := len(detail.CIStatuses) > 0
+		if detail.Text != "" && !hasCI {
+			// Push 事件：超过 3 条 commit 时按 commit 折叠
+			commitCount := detail.CommitCount
+			if commitCount == 0 {
+				commitCount = detail.EventCount
+			}
+			if detail.Action == "push" && !detail.IsDeleted && commitCount > 3 {
+				commits := splitCommits(detail.Text)
+				visible := strings.Join(commits[:3], "<br>")
+				remaining := strings.Join(commits[3:], "<br>")
+				card.AddMarkdown(visible)
+				card.AddCollapsiblePanel(fmt.Sprintf("📝 展开查看其余 %d 条提交", len(commits)-3), remaining)
+			} else {
+				card.AddMarkdown(detail.Text)
+			}
+		}
+
+		// --- 2.5 CI 状态（内联到触发事件的卡片）---
+		if ciText := renderCIStatuses(detail.CIStatuses, repoUrl); ciText != "" {
+			card.AddMarkdown(ciText)
+		}
+		if detail.Notice != "" {
+			card.AddMarkdown(detail.Notice)
+		}
+
+		// --- 3. 可折叠的附加内容（PR body 中的 <details> 块等）---
+		if detail.FoldableBody != "" {
+			card.AddCollapsiblePanel("📝 展开查看详情", detail.FoldableBody)
+		}
+
+		// --- 4. 操作按钮（V2 规范：必须放在 action 容器内）---
+		var btns []ActionButton
+		if ciFailed(detail.CIStatuses) {
+			// CI 失败时只显示 CI 专用按钮，不追加通用 View Details（URL 重复）
+			btns = makeCIActionButtons(detail.CIStatuses, repoUrl)
+		} else {
+			// 非 CI 失败：Push / 删除 / 新建分支等事件不显示详情按钮
+			skipBtn := strings.Contains(detail.Title, "commits") ||
+				strings.Contains(detail.Title, "Deleted") ||
+				strings.Contains(detail.Title, "Created")
+			if detail.URL != "" && !skipBtn {
+				btnType := "primary"
+				if ContainsAny(detail.Title, "❌", "💥") {
+					btnType = "danger"
+				}
+				btns = append(btns, ActionButton{Text: "View Details", URL: detail.URL, Type: btnType})
+			}
+		}
+		if len(btns) > 0 {
+			card.AddActions("flow", btns...)
+		}
 	} // end of non-delete rendering
 
 	// --- 5. 事件发生时间（用飞书 <local_datetime> 自动适配用户时区）---
@@ -2225,23 +2238,23 @@ func htmlToMarkdown(s string) string {
 }
 
 var (
-	reBr         = regexp.MustCompile(`(?is)<br\s*/?>`)
-	reStrong     = regexp.MustCompile(`(?is)<(strong|b)\s*>(.*?)</(strong|b)>`)
-	reEm         = regexp.MustCompile(`(?is)<(em|i)\s*>(.*?)</(em|i)>`)
-	reCode       = regexp.MustCompile(`(?is)<code\s*>(.*?)</code>`)
-	reDel        = regexp.MustCompile(`(?is)<(del|s|strike)\s*>(.*?)</(del|s|strike)>`)
-	reA          = regexp.MustCompile(`(?is)<a\s+[^>]*href=["']([^"']*)["'][^>]*>(.*?)</a>`)
-	reImgAltSrc  = regexp.MustCompile(`(?is)<img\s+[^>]*alt=["']([^"']*)["'][^>]*src=["']([^"']*)["'][^>]*/?>`)
-	reImgSrcAlt  = regexp.MustCompile(`(?is)<img\s+[^>]*src=["']([^"']*)["'][^>]*alt=["']([^"']*)["'][^>]*/?>`)
-	reImgSrcOnly = regexp.MustCompile(`(?is)<img\s+[^>]*src=["']([^"']*)["'][^>]*/?>`)
-	reTable      = regexp.MustCompile(`(?is)<table.*?>(.*?)</table>`)
-	reTr         = regexp.MustCompile(`(?is)<tr.*?>(.*?)</tr>`)
-	reTd         = regexp.MustCompile(`(?is)<t[dh].*?>(.*?)</t[dh]>`)
-	reP          = regexp.MustCompile(`(?is)<p\s*>(.*?)</p>`)
-	reHeading    = regexp.MustCompile(`(?is)<h([1-6])\s*>(.*?)</h[1-6]>`)
-	reLi         = regexp.MustCompile(`(?is)<li\s*>(.*?)</li>`)
-	reBq         = regexp.MustCompile(`(?is)<blockquote\s*>(.*?)</blockquote>`)
-	reHr         = regexp.MustCompile(`(?is)<hr\s*/?>`)
+	reBr           = regexp.MustCompile(`(?is)<br\s*/?>`)
+	reStrong       = regexp.MustCompile(`(?is)<(strong|b)\s*>(.*?)</(strong|b)>`)
+	reEm           = regexp.MustCompile(`(?is)<(em|i)\s*>(.*?)</(em|i)>`)
+	reCode         = regexp.MustCompile(`(?is)<code\s*>(.*?)</code>`)
+	reDel          = regexp.MustCompile(`(?is)<(del|s|strike)\s*>(.*?)</(del|s|strike)>`)
+	reA            = regexp.MustCompile(`(?is)<a\s+[^>]*href=["']([^"']*)["'][^>]*>(.*?)</a>`)
+	reImgAltSrc    = regexp.MustCompile(`(?is)<img\s+[^>]*alt=["']([^"']*)["'][^>]*src=["']([^"']*)["'][^>]*/?>`)
+	reImgSrcAlt    = regexp.MustCompile(`(?is)<img\s+[^>]*src=["']([^"']*)["'][^>]*alt=["']([^"']*)["'][^>]*/?>`)
+	reImgSrcOnly   = regexp.MustCompile(`(?is)<img\s+[^>]*src=["']([^"']*)["'][^>]*/?>`)
+	reTable        = regexp.MustCompile(`(?is)<table.*?>(.*?)</table>`)
+	reTr           = regexp.MustCompile(`(?is)<tr.*?>(.*?)</tr>`)
+	reTd           = regexp.MustCompile(`(?is)<t[dh].*?>(.*?)</t[dh]>`)
+	reP            = regexp.MustCompile(`(?is)<p\s*>(.*?)</p>`)
+	reHeading      = regexp.MustCompile(`(?is)<h([1-6])\s*>(.*?)</h[1-6]>`)
+	reLi           = regexp.MustCompile(`(?is)<li\s*>(.*?)</li>`)
+	reBq           = regexp.MustCompile(`(?is)<blockquote\s*>(.*?)</blockquote>`)
+	reHr           = regexp.MustCompile(`(?is)<hr\s*/?>`)
 	reStripHTML    = regexp.MustCompile(`(?s)<[^>]*>`)
 	reMultiNewline = regexp.MustCompile(`\n{3,}`)
 	reDetails      = regexp.MustCompile(`(?is)<details.*?>\s*<summary.*?>(.*?)</summary>(.*?)</details>`)

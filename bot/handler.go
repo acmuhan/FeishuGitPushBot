@@ -79,6 +79,18 @@ func GithubHandler(c *gin.Context) {
 		if headSHA == "" {
 			headSHA = ext(payloadMap, "after")
 		}
+		if headSHA == "" {
+			headSHA = ext(payloadMap, "workflow_run", "head_sha")
+		}
+		if headSHA == "" {
+			headSHA = ext(payloadMap, "workflow_job", "head_sha")
+		}
+		if headSHA == "" {
+			headSHA = ext(payloadMap, "check_run", "head_sha")
+		}
+		if headSHA == "" {
+			headSHA = ext(payloadMap, "check_suite", "head_sha")
+		}
 
 		// 提取 ref 用于 CI 重调度时关联 create 事件
 		ref := ext(payloadMap, "ref")
@@ -147,6 +159,14 @@ func ext(m map[string]any, keys ...string) string {
 	case float64:
 		return fmt.Sprintf("%.0f", v)
 	case int:
+		return fmt.Sprintf("%d", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case int32:
+		return fmt.Sprintf("%d", v)
+	case uint64:
+		return fmt.Sprintf("%d", v)
+	case uint:
 		return fmt.Sprintf("%d", v)
 	}
 	return ""
