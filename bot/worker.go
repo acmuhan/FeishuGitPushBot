@@ -250,6 +250,16 @@ func workflowRunAttemptID(m map[string]any) string {
 	return fmt.Sprintf("%s:attempt:%d", baseID, attempt)
 }
 
+func buildCardWithTimeout(ctx context.Context, repo, sender, senderUrl, avatarUrl string, detail EventDetail) (*Card, error) {
+	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer buildCancel()
+	card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
+	if err := buildCtx.Err(); err != nil {
+		return nil, fmt.Errorf("failed to build card: %w", err)
+	}
+	return card, nil
+}
+
 func workflowRunStartedAt(m map[string]any) time.Time {
 	startedAtStr := ext(m, "workflow_run", "run_started_at")
 	if startedAtStr == "" {
@@ -440,13 +450,14 @@ func updateWorkflowRunRecord(
 		return nil
 	}
 
-	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
-	card := BuildCard(buildCtx, repo, sender, senderUrl, avatarUrl, detail)
-	buildCancel()
+	card, err := buildCardWithTimeout(ctx, repo, sender, senderUrl, avatarUrl, detail)
+	if err != nil {
+		return err
+	}
 	if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
 		return err
 	}
-	_, err := updateQ.Set("card_string = ?", card.String()).Exec(ctx)
+	_, err = updateQ.Set("card_string = ?", card.String()).Exec(ctx)
 	return err
 }
 
@@ -518,9 +529,14 @@ func tryMarkPreviousWorkflowRunRerun(
 		recordAvatarURL = avatarUrl
 	}
 
-	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
-	card := BuildCard(buildCtx, repo, recordSender, recordSenderURL, recordAvatarURL, previousDetail)
-	buildCancel()
+	card, err := buildCardWithTimeout(ctx, repo, recordSender, recordSenderURL, recordAvatarURL, previousDetail)
+	if err != nil {
+		slog.Warn("Failed to build previous workflow rerun notice card",
+			"github_id", record.GithubID,
+			"message_id", record.FeishuMessageID,
+			"error", err)
+		return
+	}
 	if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
 		slog.Warn("Failed to mark previous workflow message after rerun",
 			"github_id", record.GithubID,
@@ -1483,8 +1499,10 @@ func processWebhookEvent(event WebhookEvent) error {
 		return nil
 	}
 
+	workflowRerunOutsideMergeWindow := event.EventType == "workflow_run" && previousWorkflowRunRecord != nil
+
 	// 4.8 CI 事件无父消息时的处理：普通 in_progress 静默丢弃；历史 workflow rerun 允许创建独立消息
-	if isCIEvent && parentMsgID == "" && !(event.EventType == "workflow_run" && previousWorkflowRunRecord != nil) {
+	if isCIEvent && parentMsgID == "" && !workflowRerunOutsideMergeWindow {
 		status, _ := extractCIStatus(m, event.EventType)
 		if status == "in_progress" || status == "queued" || status == "waiting" {
 			slog.Info("CI event suppressed (no parent, in_progress)", "github_id", githubID, "status", status)
@@ -1493,7 +1511,7 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// 4.9 CI 事件合并：同一 commit 的多个 workflow 合并显示（仅在合并窗口内）
-	if isCIEvent && parentMsgID == "" && sha != "" && !(event.EventType == "workflow_run" && previousWorkflowRunRecord != nil) {
+	if isCIEvent && parentMsgID == "" && sha != "" && !workflowRerunOutsideMergeWindow {
 		var existingCIRecord MessageRecord
 		if err := DB.NewSelect().Model(&existingCIRecord).
 			Where("event_type IN ('workflow_run', 'workflow_job', 'check_run', 'check_suite')").
