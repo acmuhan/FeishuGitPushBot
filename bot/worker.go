@@ -250,6 +250,31 @@ func workflowRunAttemptID(m map[string]any) string {
 	return fmt.Sprintf("%s:attempt:%d", baseID, attempt)
 }
 
+func workflowRunStartedAt(m map[string]any) time.Time {
+	startedAtStr := ext(m, "workflow_run", "run_started_at")
+	if startedAtStr == "" {
+		return time.Time{}
+	}
+	startedAt, err := time.Parse(time.RFC3339, startedAtStr)
+	if err != nil {
+		return time.Time{}
+	}
+	return startedAt
+}
+
+func nextWorkflowStartedAt(current time.Time, reset bool, m map[string]any, status, conclusion string) time.Time {
+	if status != "in_progress" || conclusion != "" {
+		return current
+	}
+	if !reset && !current.IsZero() {
+		return current
+	}
+	if startedAt := workflowRunStartedAt(m); !startedAt.IsZero() {
+		return startedAt
+	}
+	return time.Now()
+}
+
 func applyWorkflowTriggeringActor(m map[string]any, sender, senderUrl, avatarUrl string) (string, string, string) {
 	login := ext(m, "workflow_run", "triggering_actor", "login")
 	if login == "" {
@@ -311,6 +336,59 @@ func findPreviousWorkflowRunRecord(ctx context.Context, repo, baseID, currentID 
 	return nil
 }
 
+func resetWorkflowTimeoutNotification(ctx context.Context, record *MessageRecord) {
+	if record == nil || DB == nil {
+		return
+	}
+	_, _ = DB.NewUpdate().Model(record).
+		Set("timeout_notified = ?", false).
+		WherePK().
+		Where("timeout_notified = ?", true).
+		Exec(ctx)
+	record.TimeoutNotified = false
+}
+
+func claimWorkflowTimeoutNotification(ctx context.Context, record *MessageRecord) bool {
+	if record == nil || DB == nil {
+		return false
+	}
+	res, err := DB.NewUpdate().Model(record).
+		Set("timeout_notified = ?", true).
+		WherePK().
+		Where("timeout_notified = ?", false).
+		Exec(ctx)
+	if err != nil {
+		slog.Warn("Failed to claim workflow timeout notification", "github_id", record.GithubID, "error", err)
+		return false
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false
+	}
+	if affected > 0 {
+		record.TimeoutNotified = true
+		return true
+	}
+	return false
+}
+
+func maybeSendWorkflowTimeoutNotification(ctx context.Context, record *MessageRecord, status, conclusion, title string) {
+	if record == nil ||
+		conclusion != "" ||
+		status != "in_progress" ||
+		record.WorkflowStartedAt.IsZero() ||
+		time.Since(record.WorkflowStartedAt) <= 10*time.Minute ||
+		record.TimeoutNotified {
+		return
+	}
+	if !claimWorkflowTimeoutNotification(ctx, record) {
+		return
+	}
+	if err := sendTimeoutNotification(record.FeishuMessageID, title, record.WorkflowStartedAt); err != nil {
+		slog.Error("Failed to send timeout notification", "github_id", record.GithubID, "error", err)
+	}
+}
+
 func updateWorkflowRunRecord(
 	ctx context.Context,
 	record *MessageRecord,
@@ -326,25 +404,18 @@ func updateWorkflowRunRecord(
 	status, conclusion := extractCIStatus(m, event.EventType)
 	setCIStatusForWorkflowRun(m, &detail, status, conclusion, ref)
 
-	if conclusion != "" && record.TimeoutNotified {
-		_, _ = DB.NewUpdate().Model(record).
-			Set("timeout_notified = ?", false).
-			WherePK().Exec(ctx)
-	}
-	if conclusion == "" && status == "in_progress" &&
-		!record.WorkflowStartedAt.IsZero() &&
-		time.Since(record.WorkflowStartedAt) > 10*time.Minute &&
-		!record.TimeoutNotified {
-		sendTimeoutNotification(record.FeishuMessageID, detail.Title, record.WorkflowStartedAt)
-		_, _ = DB.NewUpdate().Model(record).
-			Set("timeout_notified = ?", true).
-			WherePK().Exec(ctx)
+	if conclusion != "" {
+		resetWorkflowTimeoutNotification(ctx, record)
 	}
 
-	workflowStartedAt := record.WorkflowStartedAt
-	if status == "in_progress" && conclusion == "" {
-		workflowStartedAt = time.Now()
+	switchingGithubID := newGithubID != "" && newGithubID != record.GithubID
+	if switchingGithubID {
+		resetWorkflowTimeoutNotification(ctx, record)
 	}
+	workflowStartedAt := nextWorkflowStartedAt(record.WorkflowStartedAt, switchingGithubID, m, status, conclusion)
+	timeoutRecord := *record
+	timeoutRecord.WorkflowStartedAt = workflowStartedAt
+	maybeSendWorkflowTimeoutNotification(ctx, &timeoutRecord, status, conclusion, detail.Title)
 	detailJson, _ := json.Marshal(detail)
 
 	updateQ := DB.NewUpdate().Model(record).
@@ -379,25 +450,91 @@ func updateWorkflowRunRecord(
 	return err
 }
 
-func tryUpdatePreviousWorkflowRunMessage(
+func workflowRunRerunNotice(m map[string]any, sender string) string {
+	attempt := workflowRunAttempt(m)
+	if attempt <= 1 {
+		return ""
+	}
+	actor := ext(m, "workflow_run", "triggering_actor", "login")
+	if actor == "" {
+		actor = sender
+	}
+	actorText := actor
+	if actorURL := ext(m, "workflow_run", "triggering_actor", "html_url"); actorURL != "" && actor != "" {
+		actorText = fmt.Sprintf("[%s](%s)", actor, actorURL)
+	}
+	attemptText := fmt.Sprintf("attempt #%d", attempt)
+	if runURL := ext(m, "workflow_run", "html_url"); runURL != "" {
+		attemptText = fmt.Sprintf("[%s](%s)", attemptText, runURL)
+	}
+	if actorText == "" {
+		return fmt.Sprintf("🔁 This workflow was rerun as %s.", attemptText)
+	}
+	return fmt.Sprintf("🔁 This workflow was rerun as %s by %s.", attemptText, actorText)
+}
+
+func tryMarkPreviousWorkflowRunRerun(
 	ctx context.Context,
 	record *MessageRecord,
-	event WebhookEvent,
 	m map[string]any,
-	detail EventDetail,
-	repo, sender, senderUrl, avatarUrl, ref, sha string,
+	repo, repoUrl, sender, senderUrl, avatarUrl string,
 ) {
 	if record == nil {
 		return
 	}
-	if err := updateWorkflowRunRecord(ctx, record, "", event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha); err != nil {
-		slog.Warn("Failed to update previous workflow message after rerun",
+	notice := workflowRunRerunNotice(m, sender)
+	if notice == "" {
+		return
+	}
+	var previousDetail EventDetail
+	if err := json.Unmarshal([]byte(record.Content), &previousDetail); err != nil {
+		slog.Warn("Failed to parse previous workflow detail for rerun notice",
 			"github_id", record.GithubID,
 			"message_id", record.FeishuMessageID,
 			"error", err)
 		return
 	}
-	slog.Info("Previous workflow message updated after rerun", "github_id", record.GithubID, "message_id", record.FeishuMessageID)
+	previousDetail.Notice = notice
+	if previousDetail.RepoName == "" {
+		previousDetail.RepoName = repo
+	}
+	if previousDetail.RepoURL == "" {
+		previousDetail.RepoURL = repoUrl
+	}
+
+	recordSender := record.Sender
+	if recordSender == "" {
+		recordSender = sender
+	}
+	recordSenderURL := record.SenderURL
+	if recordSenderURL == "" {
+		recordSenderURL = senderUrl
+	}
+	recordAvatarURL := record.AvatarURL2
+	if recordAvatarURL == "" {
+		recordAvatarURL = record.AvatarURL
+	}
+	if recordAvatarURL == "" {
+		recordAvatarURL = avatarUrl
+	}
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Second)
+	card := BuildCard(buildCtx, repo, recordSender, recordSenderURL, recordAvatarURL, previousDetail)
+	buildCancel()
+	if err := UpdateMessage(record.FeishuMessageID, card); err != nil {
+		slog.Warn("Failed to mark previous workflow message after rerun",
+			"github_id", record.GithubID,
+			"message_id", record.FeishuMessageID,
+			"error", err)
+		return
+	}
+	detailJson, _ := json.Marshal(previousDetail)
+	_, _ = DB.NewUpdate().Model(record).
+		Set("content = ?", string(detailJson)).
+		Set("card_string = ?", card.String()).
+		WherePK().
+		Exec(ctx)
+	slog.Info("Previous workflow message marked after rerun", "github_id", record.GithubID, "message_id", record.FeishuMessageID)
 }
 
 func workflowRunDuration(m map[string]any) string {
@@ -418,15 +555,16 @@ func workflowRunDuration(m map[string]any) string {
 }
 
 // sendTimeoutNotification 发送 Workflow 超时提醒回复
-func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) {
+func sendTimeoutNotification(parentMsgID, title string, startedAt time.Time) error {
 	timeoutCard := NewCard()
 	timeoutCard.Header.Title = CardText{Tag: "plain_text", Content: "⏰ Workflow 运行超时提醒"}
 	timeoutCard.Header.Template = "orange"
 	duration := time.Since(startedAt).Round(time.Minute)
 	timeoutCard.AddMarkdown(fmt.Sprintf("**%s** 已经运行 **%s**，请检查是否卡住", title, duration))
 	if _, err := ReplyToMessage(parentMsgID, timeoutCard); err != nil {
-		slog.Error("Failed to send timeout notification", "error", err)
+		return err
 	}
+	return nil
 }
 
 // mergeRefs 合并两个删除事件的 Text，去重后返回纯分支/标签名列表（每行一个）。
@@ -844,9 +982,6 @@ func processWebhookEvent(event WebhookEvent) error {
 			if err := updateWorkflowRunRecord(ctx, record, "", event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha); err != nil {
 				return fmt.Errorf("failed to update workflow run message: %w", err)
 			}
-			if previous := findPreviousWorkflowRunRecord(ctx, repo, workflowRunBaseID(m), githubID); previous != nil && previous.FeishuMessageID != record.FeishuMessageID {
-				tryUpdatePreviousWorkflowRunMessage(ctx, previous, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha)
-			}
 			slog.Info("Workflow run attempt updated", "github_id", githubID, "attempt", workflowRunAttempt(m))
 			return nil
 		}
@@ -874,23 +1009,10 @@ func processWebhookEvent(event WebhookEvent) error {
 		if err == nil {
 			status, conclusion := extractCIStatus(m, event.EventType)
 
-			// 已完成则重置超时提醒标志
-			if conclusion != "" && record.TimeoutNotified {
-				_, _ = DB.NewUpdate().Model(&record).
-					Set("timeout_notified = ?", false).
-					WherePK().Exec(ctx)
+			if conclusion != "" {
+				resetWorkflowTimeoutNotification(ctx, &record)
 			}
-
-			// 运行中且超过 10 分钟未完成，发送超时提醒
-			if conclusion == "" && status == "in_progress" &&
-				!record.WorkflowStartedAt.IsZero() &&
-				time.Since(record.WorkflowStartedAt) > 10*time.Minute &&
-				!record.TimeoutNotified {
-				sendTimeoutNotification(record.FeishuMessageID, detail.Title, record.WorkflowStartedAt)
-				_, _ = DB.NewUpdate().Model(&record).
-					Set("timeout_notified = ?", true).
-					WherePK().Exec(ctx)
-			}
+			maybeSendWorkflowTimeoutNotification(ctx, &record, status, conclusion, detail.Title)
 
 			if record.ParentMsgID != "" {
 				// CI 内联模式：更新 CI 记录，然后刷新父消息卡片
@@ -1320,7 +1442,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		workflowStartedAt := time.Time{}
 		status, conclusion := extractCIStatus(m, event.EventType)
 		if status == "in_progress" && conclusion == "" {
-			workflowStartedAt = time.Now()
+			workflowStartedAt = nextWorkflowStartedAt(time.Time{}, true, m, status, conclusion)
 		}
 		// 构建初始 CIStatus 供 getCIStatusesForParent 直接读取
 		ciStatus := CIStatus{
@@ -1361,7 +1483,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		return nil
 	}
 
-	// 4.8 CI 事件无父消息时的处理：in_progress 静默丢弃，仅 completed/failed 创建独立消息
+	// 4.8 CI 事件无父消息时的处理：普通 in_progress 静默丢弃；历史 workflow rerun 允许创建独立消息
 	if isCIEvent && parentMsgID == "" && !(event.EventType == "workflow_run" && previousWorkflowRunRecord != nil) {
 		status, _ := extractCIStatus(m, event.EventType)
 		if status == "in_progress" || status == "queued" || status == "waiting" {
@@ -1614,7 +1736,7 @@ func processWebhookEvent(event WebhookEvent) error {
 		if isCIEvent {
 			status, conclusion := extractCIStatus(m, event.EventType)
 			if status == "in_progress" && conclusion == "" {
-				workflowStartedAt = time.Now()
+				workflowStartedAt = nextWorkflowStartedAt(time.Time{}, true, m, status, conclusion)
 			}
 		}
 
@@ -1665,7 +1787,7 @@ func processWebhookEvent(event WebhookEvent) error {
 			slog.Error("Failed to insert/update message record", "github_id", githubID, "error", insertErr)
 		}
 		if event.EventType == "workflow_run" && previousWorkflowRunRecord != nil && previousWorkflowRunRecord.FeishuMessageID != msgID {
-			tryUpdatePreviousWorkflowRunMessage(ctx, previousWorkflowRunRecord, event, m, detail, repo, sender, senderUrl, avatarUrl, ref, sha)
+			tryMarkPreviousWorkflowRunRerun(ctx, previousWorkflowRunRecord, m, repo, repoUrl, sender, senderUrl, avatarUrl)
 		}
 
 		// push 事件入库后，回填同标签 create 事件的 head_sha（create 可能先于 push 处理）

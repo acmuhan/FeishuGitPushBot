@@ -160,6 +160,14 @@ func ext(m map[string]any, keys ...string) string {
 		return fmt.Sprintf("%.0f", v)
 	case int:
 		return fmt.Sprintf("%d", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case int32:
+		return fmt.Sprintf("%d", v)
+	case uint64:
+		return fmt.Sprintf("%d", v)
+	case uint:
+		return fmt.Sprintf("%d", v)
 	}
 	return ""
 }
