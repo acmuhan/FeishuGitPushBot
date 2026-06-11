@@ -242,6 +242,22 @@ func workflowRunBaseID(m map[string]any) string {
 	return "wf:" + runID
 }
 
+func workflowRunPRNumber(m map[string]any) string {
+	prs, _ := m["pull_requests"].([]any)
+	if len(prs) == 0 {
+		return ""
+	}
+	if pr, ok := prs[0].(map[string]any); ok {
+		if num, ok := pr["number"].(float64); ok {
+			return strconv.Itoa(int(num))
+		}
+		if num, ok := pr["number"].(string); ok {
+			return num
+		}
+	}
+	return ""
+}
+
 func workflowRunAttemptID(m map[string]any) string {
 	baseID := workflowRunBaseID(m)
 	if baseID == "" {
@@ -1644,6 +1660,25 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 		if parentID == "" {
 			parentID = findRecentRepoPush(ctx, repo)
+		}
+	}
+
+	// 4.7 Workflow 关联 PR：workflow_run 事件尝试通过 pull_requests 数组或 SHA 关联父 PR 消息
+	if event.EventType == "workflow_run" && parentID == "" {
+		if prNum := workflowRunPRNumber(m); prNum != "" {
+			var record MessageRecord
+			searchID := fmt.Sprintf("pr:%s:%s", repo, prNum)
+			if err := DB.NewSelect().Model(&record).
+				Where("github_id = ?", searchID).
+				Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
+				Order("id ASC").Limit(1).Scan(ctx); err == nil {
+				parentID = record.FeishuMessageID
+			}
+		}
+		if parentID == "" && sha != "" {
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				parentID = rec.FeishuMessageID
+			}
 		}
 	}
 
