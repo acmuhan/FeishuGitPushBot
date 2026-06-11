@@ -66,18 +66,18 @@ type MessageRecord struct {
 type WebhookEvent struct {
 	bun.BaseModel `bun:"table:webhook_events,alias:we"`
 
-	ID             uint64    `bun:",pk,autoincrement"`
-	DeliveryID     string    `bun:",unique"`            // X-GitHub-Delivery 标头，用于幂等性检查
-	EventType      string    `bun:",notnull"`           // X-GitHub-Event 标头
-	HookID         int64     `bun:""`                   // X-GitHub-Hook-ID 标头
-	Payload        string    `bun:"type:text"`          // 原始 Webhook 负载
-	Status         string    `bun:",default:'pending'"` // pending, processed, failed
-	RetryCount     int       `bun:",default:0"`
-	RescheduleCount int      `bun:",default:0"` // CI 事件等待 push 事件的重调度次数
-	HeadSHA         string   `bun:""`           // 从 payload 中提取的 head SHA，用于快速 CI 重调度查找
-	Ref             string   `bun:""`           // 分支/标签引用，用于 CI 重调度时关联 create 事件
-	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	ID              uint64    `bun:",pk,autoincrement"`
+	DeliveryID      string    `bun:",unique"`            // X-GitHub-Delivery 标头，用于幂等性检查
+	EventType       string    `bun:",notnull"`           // X-GitHub-Event 标头
+	HookID          int64     `bun:""`                   // X-GitHub-Hook-ID 标头
+	Payload         string    `bun:"type:text"`          // 原始 Webhook 负载
+	Status          string    `bun:",default:'pending'"` // pending, processed, failed
+	RetryCount      int       `bun:",default:0"`
+	RescheduleCount int       `bun:",default:0"` // CI 事件等待 push 事件的重调度次数
+	HeadSHA         string    `bun:""`           // 从 payload 中提取的 head SHA，用于快速 CI 重调度查找
+	Ref             string    `bun:""`           // 分支/标签引用，用于 CI 重调度时关联 create 事件
+	CreatedAt       time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt       time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
 // ImageCache 图片缓存表，加速头像显示
@@ -88,6 +88,15 @@ type ImageCache struct {
 	ImgKey    string    `bun:",notnull"`
 	Hash      string    `bun:",nullzero"` // 图片内容的哈希值 (MD5)
 	UpdatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+// EventLock 是跨实例短租约锁，用于串行化会产生合并消息的事件。
+type EventLock struct {
+	bun.BaseModel `bun:"table:event_locks,alias:el"`
+
+	LockKey   string    `bun:",pk"`
+	ExpiresAt time.Time `bun:",notnull"`
+	CreatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
 // InitDB 初始化数据库连接并执行 SQL 迁移

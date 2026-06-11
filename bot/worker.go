@@ -2,16 +2,15 @@ package bot
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
-	"time"
-
 	"strings"
 	"sync"
-
-	"github.com/google/go-github/v84/github"
+	"time"
 )
 
 // StartWorker 启动消息队列处理工作者和图片刷新任务
@@ -31,30 +30,17 @@ func StartWorker() {
 func messageWorker() {
 	slog.Info("Message worker started")
 	for {
-		// 每次取一条待处理的消息：
-		// 1. 状态为 pending
-		// 2. 状态为 failed 且重试次数 < 5，且距离上次更新已过去一定时间 (简单指数退避)
-		var event WebhookEvent
-		err := DB.NewSelect().Model(&event).
-			Where("status = ?", "pending").
-			WhereOr("status = ? AND retry_count < 5 AND updated_at < ?", "failed", time.Now().Add(-1*time.Minute)).
-			Order("id ASC").
-			Limit(1).
-			Scan(context.Background())
-
+		event, err := claimNextWebhookEvent(context.Background())
 		if err != nil {
 			// 如果没消息，歇会儿
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// 标记为处理中
-		_, _ = DB.NewUpdate().Model(&event).Set("status = ?", "processing").WherePK().Exec(context.Background())
-
-		err = processWebhookEvent(event)
+		err = processWebhookEvent(*event)
 		if err != nil {
 			slog.Error("Failed to process Webhook event", "id", event.ID, "error", err)
-			_, _ = DB.NewUpdate().Model(&event).
+			_, _ = DB.NewUpdate().Model(event).
 				Set("status = ?", "failed").
 				Set("retry_count = retry_count + 1").
 				Set("updated_at = ?", time.Now()).
@@ -65,7 +51,7 @@ func messageWorker() {
 			if err := DB.NewSelect().Model(&current).Where("id = ?", event.ID).Column("status").Scan(context.Background()); err == nil && current.Status == "pending" {
 				// 已被重新排队，跳过 processed 标记
 			} else {
-				_, _ = DB.NewUpdate().Model(&event).
+				_, _ = DB.NewUpdate().Model(event).
 					Set("status = ?", "processed").
 					Set("updated_at = ?", time.Now()).
 					WherePK().Exec(context.Background())
@@ -74,6 +60,94 @@ func messageWorker() {
 
 		// 推送间隔，保证节奏
 		time.Sleep(1 * time.Second)
+	}
+}
+
+func claimNextWebhookEvent(ctx context.Context) (*WebhookEvent, error) {
+	var event WebhookEvent
+	err := DB.NewRaw(`
+		UPDATE webhook_events
+		SET status = 'processing', updated_at = NOW()
+		WHERE id = (
+			SELECT id
+			FROM webhook_events
+			WHERE status = 'pending'
+				OR (
+					status = 'failed'
+					AND retry_count < 5
+					AND updated_at < ?
+				)
+			ORDER BY id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING *
+	`, time.Now().Add(-1*time.Minute)).Scan(ctx, &event)
+	if err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+func webhookMergeLockKey(eventType string, detail EventDetail, repo string) string {
+	if repo == "" || !detail.IsDeleted {
+		return ""
+	}
+	if eventType == "push" {
+		if detail.IsTag {
+			return fmt.Sprintf("merge:tag-delete:%s", repo)
+		}
+		return fmt.Sprintf("merge:branch-delete:%s", repo)
+	}
+	return ""
+}
+
+// acquireEventLock 原子地抢占一个事件合并锁，避免两个实例并发处理同仓库的
+// 删除事件。锁有 TTL，进程崩溃后会自动过期。
+//
+// 实现采用单条 INSERT ... ON CONFLICT DO UPDATE ... WHERE ... RETURNING，
+// 在一次往返中完成"清掉过期锁 + 抢占"两件事：
+//   - 键不存在 → 走 INSERT 分支，返回新行
+//   - 键存在且 expires_at < NOW() → 走 DO UPDATE 分支，覆盖过期锁
+//   - 键存在且未过期 → WHERE 过滤掉 DO UPDATE，RETURNING 为空 → 继续等待
+//
+// 这消除了之前"先 DELETE 过期 + 再 INSERT 竞争"两步操作之间的 TOCTOU 窗口。
+func acquireEventLock(ctx context.Context, key string, ttl time.Duration) (func(), error) {
+	if key == "" || DB == nil {
+		return func() {}, nil
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		var got EventLock
+		err := DB.NewRaw(`
+			INSERT INTO event_locks (lock_key, expires_at)
+			VALUES (?, ?)
+			ON CONFLICT (lock_key) DO UPDATE
+			SET expires_at = EXCLUDED.expires_at
+			WHERE event_locks.expires_at < NOW()
+			RETURNING lock_key
+		`, key, time.Now().Add(ttl)).Scan(ctx, &got)
+
+		if err == nil && got.LockKey == key {
+			return func() {
+				_, _ = DB.NewDelete().Model((*EventLock)(nil)).
+					Where("lock_key = ?", key).
+					Exec(context.Background())
+			}, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for event lock %q", key)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -130,7 +204,7 @@ func tryMergeWithExisting(
 		idArgs = append(idArgs, like)
 	}
 	if len(idClauses) > 0 {
-		q = q.Where(strings.Join(idClauses, " OR "), idArgs...)
+		q = q.Where("("+strings.Join(idClauses, " OR ")+")", idArgs...)
 	}
 	if search.eventType != "" {
 		q = q.Where("event_type = ?", search.eventType)
@@ -1034,7 +1108,7 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	// 1. 解析 Payload
 	payload := []byte(event.Payload)
-	githubEvent, err := github.ParseWebHook(event.EventType, payload)
+	githubEvent, err := parseWebhookPayload(event.EventType, payload)
 	if err != nil {
 		return fmt.Errorf("failed to parse Webhook: %w", err)
 	}
@@ -1045,11 +1119,10 @@ func processWebhookEvent(event WebhookEvent) error {
 		"installation_repositories": true, "installation_target": true,
 		"github_app_authorization": true, "marketplace_purchase": true,
 		"registry_package": true, "content_reference": true,
-		"personal_access_token_request": true, "custom_property": true,
-		"custom_property_values": true, "repository_import": true,
-		"security_and_analysis": true, "secret_scanning_alert_location": true,
+		"custom_property": true, "custom_property_values": true,
+		"repository_import": true, "secret_scanning_alert_location": true,
 		"deployment_protection_rule": true, "deployment_review": true,
-		"user": true, "org_block": true, "sponsorship": true,
+		"user": true, "sponsorship": true,
 	}
 	if adminEvents[event.EventType] {
 		return nil
@@ -1197,8 +1270,32 @@ func processWebhookEvent(event WebhookEvent) error {
 		githubID = fmt.Sprintf("status:%s:%s:%s", repo, ext(m, "sha"), ext(m, "context"))
 	case "branch_protection_rule":
 		githubID = fmt.Sprintf("bprule:%s:%s", repo, ext(m, "rule", "id"))
+	case "branch_protection_configuration":
+		githubID = fmt.Sprintf("bpconfig:%s:%s", repo, ext(m, "action"))
 	case "repository_ruleset":
 		githubID = fmt.Sprintf("ruleset:%s:%s", repo, ext(m, "repository_ruleset", "id"))
+	case "repository_advisory":
+		githubID = fmt.Sprintf("repository_advisory:%s:%s", repo, ext(m, "repository_advisory", "ghsa_id"))
+	case "repository":
+		githubID = fmt.Sprintf("repository:%s:%s", repo, ext(m, "action"))
+	case "public":
+		githubID = fmt.Sprintf("public:%s", repo)
+	case "member":
+		githubID = fmt.Sprintf("member:%s:%s:%s", repo, ext(m, "member", "id"), ext(m, "action"))
+	case "membership":
+		githubID = fmt.Sprintf("membership:%s:%s:%s:%s", ext(m, "organization", "login"), ext(m, "team", "id"), ext(m, "member", "id"), ext(m, "action"))
+	case "team":
+		githubID = fmt.Sprintf("team:%s:%s:%s", repo, ext(m, "team", "id"), ext(m, "action"))
+	case "organization":
+		githubID = fmt.Sprintf("organization:%s:%s:%s", ext(m, "organization", "login"), ext(m, "membership", "user", "id"), ext(m, "action"))
+	case "org_block":
+		githubID = fmt.Sprintf("org_block:%s:%s:%s", ext(m, "organization", "login"), ext(m, "blocked_user", "id"), ext(m, "action"))
+	case "security_and_analysis":
+		githubID = fmt.Sprintf("security_analysis:%s", repo)
+	case "personal_access_token_request":
+		githubID = fmt.Sprintf("pat_request:%s:%s", ext(m, "organization", "login"), ext(m, "personal_access_token_request", "id"))
+	case "deploy_key":
+		githubID = fmt.Sprintf("deploy_key:%s:%s:%s", repo, ext(m, "key", "id"), ext(m, "action"))
 	case "code_scanning_alert":
 		githubID = fmt.Sprintf("codescan:%s:%s", repo, ext(m, "alert", "number"))
 	case "dependabot_alert":
@@ -1221,6 +1318,14 @@ func processWebhookEvent(event WebhookEvent) error {
 				githubID = fmt.Sprintf("issue:%s:%s", repo, issueNum)
 			}
 		}
+	}
+
+	if lockKey := webhookMergeLockKey(event.EventType, detail, repo); lockKey != "" {
+		releaseLock, err := acquireEventLock(ctx, lockKey, 2*time.Minute)
+		if err != nil {
+			return err
+		}
+		defer releaseLock()
 	}
 
 	// 3.5 跳过非 "created"/"submitted" 的评论/Review 事件（避免 edited/deleted 通知噪音）
@@ -1522,10 +1627,17 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
-	// 4.4 标签删除合并：同一仓库在合并窗口内的标签删除合并
-	if event.EventType == "delete" && detail.IsTag {
+	// 4.4 标签删除合并：同一仓库在合并窗口内的标签删除合并（支持 push 与历史 delete 事件）
+	if (event.EventType == "push" || event.EventType == "delete") && detail.IsDeleted && detail.IsTag {
 		merged, err := tryMergeWithExisting(ctx,
-			mergeSearch{githubIDLike: fmt.Sprintf("delete:%s:tag:%%", repo), withinWindow: true},
+			mergeSearch{
+				githubIDLikes: []string{
+					fmt.Sprintf("push:%s:refs/tags/%%", repo),
+					fmt.Sprintf("delete:%s:tag:%%", repo),
+				},
+				recordType:   "deleted",
+				withinWindow: true,
+			},
 			func(old, new *EventDetail) {
 				if old.Text != "" {
 					new.Text = mergeRefs(old.Text, new.Text)

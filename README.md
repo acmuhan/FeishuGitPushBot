@@ -36,7 +36,7 @@
 
 > 配置后，机器人将支持：
 >
-> 1. **消息合并**：同类事件在配置的时间窗口内（默认 10 分钟）自动合并为一条消息，避免频繁刷屏。
+> 1. **消息合并**：同类事件在配置的时间窗口内（默认 15 分钟）自动合并为一条消息，避免频繁刷屏。
 > 2. **状态更新**：GitHub Actions / Check Suite 的进度会实时更新在同一条消息中，而不是重复发送。
 > 3. **关联回复**：评论（Issue/PR）将以话题模式回复到对应的推送消息下。
 > 4. **IP 白名单**：可限制仅接受来自 GitHub 官方 IP 的 Webhook 请求，提升安全性。
@@ -72,11 +72,14 @@ docker run -d -p 8080:8080 \
 - **Events**: 选择 `Let me select individual events`，建议勾选以下项以获得最佳体验：
   - **核心开发**: `Pushes`, `Pull requests`, `Issues`, `Releases`
   - **CI/CD 监控**: `Workflow runs`, `Workflow jobs` (必须开启以支持状态实时更新)
-  - **互动交流**: `Issue comments`, `Pull request reviews`, `Pull request review comments`
+  - **互动交流**: `Issue comments`, `Pull request reviews`, `Pull request review comments`, `Commit comments`
+  - **安全审计**: `Branch protection configurations`, `Branch protection rules`, `Repository rulesets`, `Repository`, `Public`, `Member`, `Memberships`, `Team`, `Organization`, `Org blocks`, `Personal access token requests`, `Deploy keys`, `Security and analysis`, `Code scanning alerts`, `Dependabot alerts`, `Secret scanning alerts`, `Repository vulnerability alerts`, `Repository advisories`
   - **社交反馈**: `Stars`, `Forks`, `Watches` (可选)
   
 > [!IMPORTANT]
-> **注意**: 请勿勾选 `Branch or tag creation` 和 `Branch or tag deletion` 事件，这些信息已包含在 `Push` 事件中，重复勾选会导致冗余且无内容的通知。
+> **必须关闭**: 请勿勾选 `Branch or tag creation` 和 `Branch or tag deletion`。分支和标签的创建/删除已经包含在 `Pushes` 中，重复勾选会增加 webhook delivery 数量，容易造成重复通知。
+>
+> **按需关闭**: `Repository imports`, `Page builds` 通常不属于安全审计主路径；除非你明确希望接收导入或 GitHub Pages 构建状态，否则保持关闭。
 
 ## 📂 项目结构
 

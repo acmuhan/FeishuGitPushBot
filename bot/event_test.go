@@ -13,6 +13,7 @@ import (
 // helper functions to create pointers
 func strPtr(s string) *string { return &s }
 func int64Ptr(i int64) *int64 { return &i }
+func boolPtr(b bool) *bool    { return &b }
 func tsPtr(t time.Time) *github.Timestamp {
 	ts := github.Timestamp{Time: t}
 	return &ts
@@ -437,6 +438,321 @@ func TestParseEventNewTypes(t *testing.T) {
 			fmt.Printf("✓ %s: Title=%q, Text=%q\n", tt.name, detail.Title, detail.Text[:min(50, len(detail.Text))])
 		})
 	}
+}
+
+func TestParseRefLifecycleUsesPushEvents(t *testing.T) {
+	repo := &github.PushEventRepository{
+		Name:    strPtr("repo"),
+		HTMLURL: strPtr("https://github.com/test/repo"),
+	}
+
+	tests := []struct {
+		name        string
+		event       any
+		eventType   string
+		wantTitle   string
+		wantText    string
+		wantTag     bool
+		wantDeleted bool
+		wantSkip    bool
+	}{
+		{
+			name: "tag created from push",
+			event: &github.PushEvent{
+				Ref:     strPtr("refs/tags/v1.2.3"),
+				Created: boolPtr(true),
+				Repo:    repo,
+			},
+			eventType: "push",
+			wantTitle: "🏷️ New Tag: v1.2.3",
+			wantText:  "🏷️ v1.2.3",
+			wantTag:   true,
+		},
+		{
+			name: "tag deleted from push",
+			event: &github.PushEvent{
+				Ref:     strPtr("refs/tags/v1.2.3"),
+				Deleted: boolPtr(true),
+				Repo:    repo,
+			},
+			eventType:   "push",
+			wantTitle:   "🗑️ Tag Deleted: repo",
+			wantText:    "v1.2.3",
+			wantTag:     true,
+			wantDeleted: true,
+		},
+		{
+			name: "create webhook skipped",
+			event: &github.CreateEvent{
+				Ref:     strPtr("v1.2.3"),
+				RefType: strPtr("tag"),
+			},
+			eventType: "create",
+			wantSkip:  true,
+		},
+		{
+			name: "delete webhook skipped",
+			event: &github.DeleteEvent{
+				Ref:     strPtr("feat/old"),
+				RefType: strPtr("branch"),
+			},
+			eventType: "delete",
+			wantSkip:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detail := ParseEvent(tt.event, tt.eventType)
+			if detail.Skip != tt.wantSkip {
+				t.Fatalf("Skip = %v, want %v", detail.Skip, tt.wantSkip)
+			}
+			if tt.wantSkip {
+				return
+			}
+			if detail.Title != tt.wantTitle {
+				t.Fatalf("Title = %q, want %q", detail.Title, tt.wantTitle)
+			}
+			if detail.Text != tt.wantText {
+				t.Fatalf("Text = %q, want %q", detail.Text, tt.wantText)
+			}
+			if detail.IsTag != tt.wantTag {
+				t.Fatalf("IsTag = %v, want %v", detail.IsTag, tt.wantTag)
+			}
+			if detail.IsDeleted != tt.wantDeleted {
+				t.Fatalf("IsDeleted = %v, want %v", detail.IsDeleted, tt.wantDeleted)
+			}
+		})
+	}
+}
+
+func TestWebhookMergeLockKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		detail    EventDetail
+		repo      string
+		want      string
+	}{
+		{
+			name:      "branch delete push",
+			eventType: "push",
+			detail:    EventDetail{IsDeleted: true},
+			repo:      "test/repo",
+			want:      "merge:branch-delete:test/repo",
+		},
+		{
+			name:      "tag delete push",
+			eventType: "push",
+			detail:    EventDetail{IsDeleted: true, IsTag: true},
+			repo:      "test/repo",
+			want:      "merge:tag-delete:test/repo",
+		},
+		{
+			name:      "ordinary push",
+			eventType: "push",
+			detail:    EventDetail{},
+			repo:      "test/repo",
+		},
+		{
+			name:      "delete webhook skipped before lock",
+			eventType: "delete",
+			detail:    EventDetail{IsDeleted: true},
+			repo:      "test/repo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := webhookMergeLockKey(tt.eventType, tt.detail, tt.repo); got != tt.want {
+				t.Fatalf("webhookMergeLockKey() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSecurityAuditEvents(t *testing.T) {
+	now := time.Now()
+
+	t.Run("personal access token request", func(t *testing.T) {
+		detail := ParseEvent(&github.PersonalAccessTokenRequestEvent{
+			Action: strPtr("created"),
+			PersonalAccessTokenRequest: &github.PersonalAccessTokenRequest{
+				ID:                  int64Ptr(42),
+				Owner:               &github.User{Login: strPtr("token-owner"), HTMLURL: strPtr("https://github.com/token-owner")},
+				RepositorySelection: strPtr("subset"),
+				RepositoryCount:     int64Ptr(2),
+				CreatedAt:           &github.Timestamp{Time: now},
+				PermissionsResult:   &github.PersonalAccessTokenPermissions{Repo: map[string]string{"contents": "read", "metadata": "read"}},
+				PermissionsAdded:    &github.PersonalAccessTokenPermissions{Repo: map[string]string{"contents": "read"}},
+				PermissionsUpgraded: &github.PersonalAccessTokenPermissions{},
+				TokenExpiresAt:      &github.Timestamp{Time: now.Add(24 * time.Hour)},
+				TokenLastUsedAt:     &github.Timestamp{},
+				TokenExpired:        boolPtr(false),
+			},
+			Org:    &github.Organization{Login: strPtr("test-org"), HTMLURL: strPtr("https://github.com/test-org")},
+			Sender: &github.User{Login: strPtr("security-admin"), AvatarURL: strPtr("https://avatars.githubusercontent.com/u/1")},
+		}, "personal_access_token_request")
+
+		if detail.Skip {
+			t.Fatal("expected PAT request event to be rendered")
+		}
+		if detail.Title != "🔑 Personal Access Token Request Created" {
+			t.Fatalf("Title = %q", detail.Title)
+		}
+		for _, want := range []string{"Request ID: `42`", "Owner: **token-owner**", "Repository selection: **subset**", "`repository.contents`: **read**"} {
+			if !strings.Contains(detail.Text, want) {
+				t.Fatalf("Text missing %q: %s", want, detail.Text)
+			}
+		}
+	})
+
+	t.Run("security and analysis", func(t *testing.T) {
+		detail := ParseEvent(&github.SecurityAndAnalysisEvent{
+			Repository: &github.Repository{
+				FullName: strPtr("test/repo"),
+				HTMLURL:  strPtr("https://github.com/test/repo"),
+				SecurityAndAnalysis: &github.SecurityAndAnalysis{
+					SecretScanning:               &github.SecretScanning{Status: strPtr("enabled")},
+					SecretScanningPushProtection: &github.SecretScanningPushProtection{Status: strPtr("enabled")},
+				},
+			},
+			Changes: &github.SecurityAndAnalysisChange{
+				From: &github.SecurityAndAnalysisChangeFrom{
+					SecurityAndAnalysis: &github.SecurityAndAnalysis{
+						SecretScanning: &github.SecretScanning{Status: strPtr("disabled")},
+					},
+				},
+			},
+			Sender: &github.User{Login: strPtr("security-admin"), AvatarURL: strPtr("https://avatars.githubusercontent.com/u/1")},
+		}, "security_and_analysis")
+
+		if detail.Skip {
+			t.Fatal("expected security_and_analysis event to be rendered")
+		}
+		if detail.Title != "🛡️ Security & Analysis Changed" {
+			t.Fatalf("Title = %q", detail.Title)
+		}
+		for _, want := range []string{"Repository: **test/repo**", "Previous Secret scanning: **disabled**", "Current Secret scanning: **enabled**"} {
+			if !strings.Contains(detail.Text, want) {
+				t.Fatalf("Text missing %q: %s", want, detail.Text)
+			}
+		}
+	})
+
+	t.Run("branch protection configuration", func(t *testing.T) {
+		detail := ParseEvent(&github.BranchProtectionConfigurationEvent{
+			Action: strPtr("enabled"),
+			Repo: &github.Repository{
+				FullName: strPtr("test/repo"),
+				HTMLURL:  strPtr("https://github.com/test/repo"),
+			},
+			Sender: &github.User{Login: strPtr("security-admin"), AvatarURL: strPtr("https://avatars.githubusercontent.com/u/1")},
+		}, "branch_protection_configuration")
+
+		if detail.Skip {
+			t.Fatal("expected branch_protection_configuration event to be rendered")
+		}
+		if detail.Title != "🛡️ Branch Protection Configuration Enabled" {
+			t.Fatalf("Title = %q", detail.Title)
+		}
+		if !strings.Contains(detail.Text, "Repository: **test/repo**") {
+			t.Fatalf("Text missing repository: %s", detail.Text)
+		}
+	})
+
+	t.Run("org block", func(t *testing.T) {
+		detail := ParseEvent(&github.OrgBlockEvent{
+			Action:       strPtr("blocked"),
+			Organization: &github.Organization{Login: strPtr("test-org")},
+			BlockedUser:  &github.User{Login: strPtr("blocked-user"), HTMLURL: strPtr("https://github.com/blocked-user")},
+			Sender:       &github.User{Login: strPtr("security-admin"), AvatarURL: strPtr("https://avatars.githubusercontent.com/u/1")},
+		}, "org_block")
+
+		if detail.Skip {
+			t.Fatal("expected org_block event to be rendered")
+		}
+		if detail.Title != "🚫 Org User Blocked: blocked-user" {
+			t.Fatalf("Title = %q", detail.Title)
+		}
+		if !strings.Contains(detail.Text, "Organization: **test-org**") {
+			t.Fatalf("Text missing organization: %s", detail.Text)
+		}
+	})
+
+	t.Run("repository advisory raw fallback", func(t *testing.T) {
+		payload := []byte(`{
+			"action": "published",
+			"repository_advisory": {
+				"ghsa_id": "GHSA-abcd-1234-5678",
+				"summary": "Test advisory",
+				"severity": "high",
+				"html_url": "https://github.com/test/repo/security/advisories/GHSA-abcd-1234-5678"
+			},
+			"repository": {
+				"full_name": "test/repo",
+				"html_url": "https://github.com/test/repo"
+			},
+			"sender": {
+				"login": "security-admin",
+				"avatar_url": "https://avatars.githubusercontent.com/u/1"
+			}
+		}`)
+
+		event, err := parseWebhookPayload("repository_advisory", payload)
+		if err != nil {
+			t.Fatalf("parseWebhookPayload() error = %v", err)
+		}
+
+		detail := ParseEvent(event, "repository_advisory")
+		if detail.Skip {
+			t.Fatal("expected repository_advisory event to be rendered")
+		}
+		if detail.Title != "🛡️ Repository Advisory Published" {
+			t.Fatalf("Title = %q", detail.Title)
+		}
+		for _, want := range []string{"Repository: **test/repo**", "GHSA: `GHSA-abcd-1234-5678`", "Severity: **high**", "Summary: **Test advisory**", "By: **security-admin**"} {
+			if !strings.Contains(detail.Text, want) {
+				t.Fatalf("Text missing %q: %s", want, detail.Text)
+			}
+		}
+		if detail.URL != "https://github.com/test/repo/security/advisories/GHSA-abcd-1234-5678" {
+			t.Fatalf("URL = %q", detail.URL)
+		}
+	})
+
+	t.Run("deploy key", func(t *testing.T) {
+		detail := ParseEvent(&github.DeployKeyEvent{
+			Action: strPtr("created"),
+			Key: &github.Key{
+				ID:        int64Ptr(1001),
+				Title:     strPtr("production deploy"),
+				ReadOnly:  boolPtr(false),
+				AddedBy:   strPtr("platform-admin"),
+				CreatedAt: &github.Timestamp{Time: now},
+			},
+			Repo: &github.Repository{
+				FullName: strPtr("test/repo"),
+				HTMLURL:  strPtr("https://github.com/test/repo"),
+			},
+			Sender: &github.User{Login: strPtr("security-admin"), AvatarURL: strPtr("https://avatars.githubusercontent.com/u/1")},
+		}, "deploy_key")
+
+		if detail.Skip {
+			t.Fatal("expected deploy_key event to be rendered")
+		}
+		if detail.Title != "🔐 Deploy Key Created: production deploy" {
+			t.Fatalf("Title = %q", detail.Title)
+		}
+		for _, want := range []string{"Repository: **test/repo**", "Key: **production deploy**", "Key ID: `1001`", "Access: **read/write**", "Added by: **platform-admin**", "By: **security-admin**"} {
+			if !strings.Contains(detail.Text, want) {
+				t.Fatalf("Text missing %q: %s", want, detail.Text)
+			}
+		}
+		if detail.URL != "https://github.com/test/repo" {
+			t.Fatalf("URL = %q", detail.URL)
+		}
+	})
 }
 
 func min(a, b int) int {

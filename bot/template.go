@@ -85,12 +85,6 @@ func ParseEvent(event any, eventType string) EventDetail {
 			repoUrl = repo.GetHTMLURL()
 		}
 
-		// 跳过 tag 的创建和删除事件，由 CreateEvent/DeleteEvent 处理，避免重复推送
-		if isTag && (e.GetCreated() || e.GetDeleted()) {
-			d.Skip = true
-			return d
-		}
-
 		if isTag {
 			d.Title = fmt.Sprintf("🏷️ Tag: %s", refShort)
 			d.RefName = refShort
@@ -626,43 +620,12 @@ func ParseEvent(event any, eventType string) EventDetail {
 		d.Text = strings.Join(pages, "\n")
 
 	case *github.CreateEvent:
-		if e.GetRefType() == "tag" {
-			ref := e.GetRef()
-			repoUrl := ""
-			if repo := e.GetRepo(); repo != nil {
-				repoUrl = repo.GetHTMLURL()
-			}
-			d.Title = fmt.Sprintf("🏷️ New Tag: %s", ref)
-			d.RefName = ref
-			if repoUrl != "" {
-				d.RefURL = fmt.Sprintf("%s/releases/tag/%s", repoUrl, ref)
-				d.URL = d.RefURL
-			}
-			d.IsTag = true
-			d.Text = fmt.Sprintf("🏷️ %s", ref)
-		} else {
-			// 分支创建通常由 Push 事件处理，这里跳过
-			d.Skip = true
-		}
+		// Branch/tag creations are already included in push events.
+		d.Skip = true
 
 	case *github.DeleteEvent:
-		ref := e.GetRef()
-		repoName := ""
-		if repo := e.GetRepo(); repo != nil {
-			repoName = repo.GetName()
-		}
-		if e.GetRefType() == "tag" {
-			d.Title = fmt.Sprintf("🗑️ Tag Deleted: %s", repoName)
-			d.RefName = ref
-			d.IsTag = true
-			d.IsDeleted = true
-			d.Text = ref
-		} else {
-			d.Title = fmt.Sprintf("🗑️ Branch Deleted: %s", repoName)
-			d.RefName = ref
-			d.IsDeleted = true
-			d.Text = ref
-		}
+		// Branch/tag deletions are already included in push events.
+		d.Skip = true
 
 	case *github.PublicEvent:
 		d.Title = "🔓 Repository Made Public"
@@ -693,6 +656,40 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.Skip = true
 		}
 		d.Action = action
+
+	case *github.DeployKeyEvent:
+		key := e.GetKey()
+		repo := e.GetRepo()
+		if key == nil || repo == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🔐 Deploy Key %s: %s", titleCase(action), key.GetTitle())
+		d.Action = action
+		lines := []string{
+			fmt.Sprintf("Repository: **%s**", repo.GetFullName()),
+			fmt.Sprintf("Key: **%s**", key.GetTitle()),
+			fmt.Sprintf("Key ID: `%d`", key.GetID()),
+		}
+		if key.GetReadOnly() {
+			lines = append(lines, "Access: **read-only**")
+		} else {
+			lines = append(lines, "Access: **read/write**")
+		}
+		if addedBy := key.GetAddedBy(); addedBy != "" {
+			lines = append(lines, fmt.Sprintf("Added by: **%s**", addedBy))
+		}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("By: **%s**", sender.GetLogin()))
+			d.AuthorLogins = []string{sender.GetLogin()}
+			d.AuthorAvatars = []string{sender.GetAvatarURL()}
+		}
+		d.Text = strings.Join(lines, "\n")
+		d.URL = repo.GetHTMLURL()
+		if ts := key.GetCreatedAt(); !ts.IsZero() {
+			d.EventTime = ts.Format(time.RFC3339)
+		}
 
 	case *github.OrganizationEvent:
 		org := e.GetOrganization()
@@ -731,6 +728,81 @@ func ParseEvent(event any, eventType string) EventDetail {
 		}
 		if ts := org.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Format(time.RFC3339)
+		}
+
+	case *github.OrgBlockEvent:
+		blockedUser := e.GetBlockedUser()
+		org := e.GetOrganization()
+		if blockedUser == nil || org == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🚫 Org User %s: %s", titleCase(action), blockedUser.GetLogin())
+		d.Action = action
+		lines := []string{
+			fmt.Sprintf("Organization: **%s**", org.GetLogin()),
+			fmt.Sprintf("User: **%s**", blockedUser.GetLogin()),
+			fmt.Sprintf("Action: **%s**", action),
+		}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("By: **%s**", sender.GetLogin()))
+			d.AuthorLogins = []string{sender.GetLogin()}
+			d.AuthorAvatars = []string{sender.GetAvatarURL()}
+		}
+		d.Text = strings.Join(lines, "\n")
+		d.URL = blockedUser.GetHTMLURL()
+
+	case *github.PersonalAccessTokenRequestEvent:
+		req := e.GetPersonalAccessTokenRequest()
+		if req == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🔑 Personal Access Token Request %s", titleCase(action))
+		d.Action = action
+
+		lines := []string{fmt.Sprintf("Action: **%s**", action)}
+		if req.GetID() != 0 {
+			lines = append(lines, fmt.Sprintf("Request ID: `%d`", req.GetID()))
+		}
+		if owner := req.GetOwner(); owner != nil && owner.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("Owner: **%s**", owner.GetLogin()))
+			d.URL = owner.GetHTMLURL()
+			d.AuthorLogins = append(d.AuthorLogins, owner.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, owner.GetAvatarURL())
+		}
+		if org := e.GetOrg(); org != nil && org.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("Organization: **%s**", org.GetLogin()))
+			if d.URL == "" {
+				d.URL = org.GetHTMLURL()
+			}
+		}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("By: **%s**", sender.GetLogin()))
+			d.AuthorLogins = append(d.AuthorLogins, sender.GetLogin())
+			d.AuthorAvatars = append(d.AuthorAvatars, sender.GetAvatarURL())
+		}
+		if selection := req.GetRepositorySelection(); selection != "" {
+			lines = append(lines, fmt.Sprintf("Repository selection: **%s**", selection))
+		}
+		if count := req.GetRepositoryCount(); count > 0 {
+			lines = append(lines, fmt.Sprintf("Repository count: **%d**", count))
+		}
+		if expiresAt := req.GetTokenExpiresAt(); !expiresAt.IsZero() {
+			lines = append(lines, fmt.Sprintf("Token expires: **%s**", expiresAt.Format(time.RFC3339)))
+		}
+		if req.GetTokenExpired() {
+			lines = append(lines, "Token expired: **true**")
+		}
+		if permissionLines := formatPersonalAccessTokenPermissions(req.GetPermissionsResult()); len(permissionLines) > 0 {
+			lines = append(lines, "Permissions:")
+			lines = append(lines, permissionLines...)
+		}
+		d.Text = strings.Join(lines, "\n")
+		if createdAt := req.GetCreatedAt(); !createdAt.IsZero() {
+			d.EventTime = createdAt.Format(time.RFC3339)
 		}
 
 	case *github.TeamEvent:
@@ -1088,6 +1160,24 @@ func ParseEvent(event any, eventType string) EventDetail {
 			d.EventTime = ts.Time.Format(time.RFC3339)
 		}
 
+	case *github.BranchProtectionConfigurationEvent:
+		repo := e.GetRepo()
+		if repo == nil {
+			d.Skip = true
+			return d
+		}
+		action := e.GetAction()
+		d.Title = fmt.Sprintf("🛡️ Branch Protection Configuration %s", titleCase(action))
+		d.Action = action
+		lines := []string{fmt.Sprintf("Repository: **%s**", repo.GetFullName())}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("By: **%s**", sender.GetLogin()))
+			d.AuthorLogins = []string{sender.GetLogin()}
+			d.AuthorAvatars = []string{sender.GetAvatarURL()}
+		}
+		d.Text = strings.Join(lines, "\n")
+		d.URL = repo.GetHTMLURL()
+
 	case *github.RepositoryRulesetEvent:
 		ruleset := e.GetRepositoryRuleset()
 		if ruleset == nil {
@@ -1101,6 +1191,29 @@ func ParseEvent(event any, eventType string) EventDetail {
 		if ts := ruleset.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Time.Format(time.RFC3339)
 		}
+
+	case *github.SecurityAndAnalysisEvent:
+		repo := e.GetRepository()
+		if repo == nil {
+			d.Skip = true
+			return d
+		}
+		d.Title = "🛡️ Security & Analysis Changed"
+		d.Action = "updated"
+		lines := []string{fmt.Sprintf("Repository: **%s**", repo.GetFullName())}
+		if sender := e.GetSender(); sender != nil && sender.GetLogin() != "" {
+			lines = append(lines, fmt.Sprintf("By: **%s**", sender.GetLogin()))
+			d.AuthorLogins = []string{sender.GetLogin()}
+			d.AuthorAvatars = []string{sender.GetAvatarURL()}
+		}
+		if previous := securityAndAnalysisFromChange(e.GetChanges()); previous != nil {
+			lines = append(lines, securityAndAnalysisLines("Previous", previous)...)
+		}
+		if current := repo.GetSecurityAndAnalysis(); current != nil {
+			lines = append(lines, securityAndAnalysisLines("Current", current)...)
+		}
+		d.Text = strings.Join(lines, "\n")
+		d.URL = repo.GetHTMLURL()
 
 	case *github.CodeScanningAlertEvent:
 		alert := e.GetAlert()
@@ -1308,8 +1421,103 @@ func ParseEvent(event any, eventType string) EventDetail {
 		if ts := build.GetCreatedAt(); !ts.IsZero() {
 			d.EventTime = ts.Time.Format(time.RFC3339)
 		}
+
+	case map[string]any:
+		if eventType == "repository_advisory" {
+			action := ext(e, "action")
+			ghsaID := ext(e, "repository_advisory", "ghsa_id")
+			summary := ext(e, "repository_advisory", "summary")
+			severity := ext(e, "repository_advisory", "severity")
+			repoName := ext(e, "repository", "full_name")
+			d.Title = fmt.Sprintf("🛡️ Repository Advisory %s", titleCase(action))
+			d.Action = action
+			var lines []string
+			if repoName != "" {
+				lines = append(lines, fmt.Sprintf("Repository: **%s**", repoName))
+			}
+			if ghsaID != "" {
+				lines = append(lines, fmt.Sprintf("GHSA: `%s`", ghsaID))
+			}
+			if severity != "" {
+				lines = append(lines, fmt.Sprintf("Severity: **%s**", severity))
+			}
+			if summary != "" {
+				lines = append(lines, fmt.Sprintf("Summary: **%s**", summary))
+			}
+			if sender := ext(e, "sender", "login"); sender != "" {
+				lines = append(lines, fmt.Sprintf("By: **%s**", sender))
+				d.AuthorLogins = []string{sender}
+				if avatar := ext(e, "sender", "avatar_url"); avatar != "" {
+					d.AuthorAvatars = []string{avatar}
+				}
+			}
+			d.Text = strings.Join(lines, "\n")
+			d.URL = ext(e, "repository_advisory", "html_url")
+			if d.URL == "" {
+				d.URL = ext(e, "repository", "html_url")
+			}
+		}
 	}
 	return d
+}
+
+func formatPersonalAccessTokenPermissions(perms *github.PersonalAccessTokenPermissions) []string {
+	if perms == nil {
+		return nil
+	}
+	var lines []string
+	lines = append(lines, formatPermissionGroup("organization", perms.Org)...)
+	lines = append(lines, formatPermissionGroup("repository", perms.Repo)...)
+	lines = append(lines, formatPermissionGroup("other", perms.Other)...)
+	return lines
+}
+
+func formatPermissionGroup(scope string, permissions map[string]string) []string {
+	if len(permissions) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(permissions))
+	for key := range permissions {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("- `%s.%s`: **%s**", scope, key, permissions[key]))
+	}
+	return lines
+}
+
+func securityAndAnalysisFromChange(change *github.SecurityAndAnalysisChange) *github.SecurityAndAnalysis {
+	if change == nil || change.GetFrom() == nil {
+		return nil
+	}
+	return change.GetFrom().GetSecurityAndAnalysis()
+}
+
+func securityAndAnalysisLines(label string, analysis *github.SecurityAndAnalysis) []string {
+	if analysis == nil {
+		return nil
+	}
+	statuses := []struct {
+		name   string
+		status string
+	}{
+		{"Advanced security", analysis.GetAdvancedSecurity().GetStatus()},
+		{"Secret scanning", analysis.GetSecretScanning().GetStatus()},
+		{"Secret scanning push protection", analysis.GetSecretScanningPushProtection().GetStatus()},
+		{"Secret scanning validity checks", analysis.GetSecretScanningValidityChecks().GetStatus()},
+		{"Dependabot security updates", analysis.GetDependabotSecurityUpdates().GetStatus()},
+	}
+
+	var lines []string
+	for _, status := range statuses {
+		if status.status != "" {
+			lines = append(lines, fmt.Sprintf("%s %s: **%s**", label, status.name, status.status))
+		}
+	}
+	return lines
 }
 
 // splitCommits 将 push 事件的文本按 commit 条目拆分

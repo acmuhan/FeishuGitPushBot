@@ -49,7 +49,7 @@ func GithubHandler(c *gin.Context) {
 		}
 	}
 
-	event, err := github.ParseWebHook(eventType, payload)
+	event, err := parseWebhookPayload(eventType, payload)
 	if err != nil {
 		slog.Error("Failed to parse Webhook",
 			"delivery_id", deliveryID,
@@ -175,4 +175,21 @@ func ext(m map[string]any, keys ...string) string {
 		return fmt.Sprintf("%d", v)
 	}
 	return ""
+}
+
+func parseWebhookPayload(eventType string, payload []byte) (any, error) {
+	event, err := github.ParseWebHook(eventType, payload)
+	if err == nil {
+		return event, nil
+	}
+
+	if eventType == "repository_advisory" {
+		var m map[string]any
+		if unmarshalErr := json.Unmarshal(payload, &m); unmarshalErr != nil {
+			return nil, unmarshalErr
+		}
+		return m, nil
+	}
+
+	return nil, err
 }
