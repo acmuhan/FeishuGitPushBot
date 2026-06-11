@@ -40,6 +40,58 @@ func TestRenderCIStatusCleansCompactWorkflowTitlePrefix(t *testing.T) {
 	assert.NotContains(t, got, "Workflow Succeeded")
 }
 
+func TestRenderCIStatusCleansNestedWorkflowTitlePrefixes(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "✅ Workflow Succeeded: ✅Workflow Succeeded: Scheduled",
+			Status:       "completed",
+			Conclusion:   "success",
+			RunID:        12345,
+		},
+	}, "")
+
+	assert.Equal(t, "✅ Scheduled **passed**", got)
+}
+
+func TestRenderCIStatusCleansUnknownWorkflowTitlePrefix(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "⚠️ Workflow Startup Failure: Scheduled",
+			Status:       "completed",
+			Conclusion:   "startup_failure",
+			RunID:        12345,
+		},
+	}, "")
+
+	assert.Equal(t, "⚠️ Scheduled **startup failure**", got)
+}
+
+func TestMakeCIActionButtonsCleansWorkflowTitlePrefix(t *testing.T) {
+	got := makeCIActionButtons([]CIStatus{
+		{
+			WorkflowName: "❌ Workflow Failed: ✅Workflow Succeeded: Scheduled",
+			Status:       "completed",
+			Conclusion:   "failure",
+			RunID:        12345,
+		},
+	}, "https://github.com/NCUHOME/putable")
+
+	assert.Len(t, got, 2)
+	assert.Equal(t, "View Scheduled Logs", got[0].Text)
+}
+
+func TestRenderCIStatusKeepsWorkflowNameThatStartsWithWorkflow(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "Workflow Builder: Test",
+			Status:       "completed",
+			Conclusion:   "success",
+		},
+	}, "")
+
+	assert.Equal(t, "✅ Workflow Builder: Test **passed**", got)
+}
+
 func TestRenderCIStatusLifecycleStates(t *testing.T) {
 	statuses := []CIStatus{
 		{WorkflowName: "CI", Status: "requested"},

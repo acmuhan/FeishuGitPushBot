@@ -1048,7 +1048,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	_ = json.Unmarshal(payload, &m)
 	repo := ext(m, "repository", "full_name")
 	repoUrl := ext(m, "repository", "html_url")
-	sender := ext(m, "sender", "login")
+	webhookSender := ext(m, "sender", "login")
+	sender := webhookSender
 	senderUrl := ext(m, "sender", "html_url")
 	avatarUrl := ext(m, "sender", "avatar_url")
 	detail.RepoName = repo   // 用于合并展示的仓库全名
@@ -1068,22 +1069,15 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	// 检查是否为 Bot 用户
 	isBotUser := false
-	if C.Github.BotUsers != "" && sender != "" {
-		// 简单的缓存或直接字符串包含检查即可，不需要每次都 Split
-		if strings.Contains(","+C.Github.BotUsers+",", ","+sender+",") {
-			isBotUser = true
-		}
+	botSender := ""
+	if matchedSender, ok := configuredBotEventActor(m, sender, webhookSender); ok {
+		isBotUser = true
+		botSender = matchedSender
 	}
-	// Bot 用户只处理 PR 和 Comment 事件，其他一律跳过
+	// Bot 用户只处理 PR 和 Comment/Issue 互动事件，其他一律跳过
 	if isBotUser {
-		isBotAllowed := event.EventType == "pull_request" ||
-			event.EventType == "pull_request_review" ||
-			event.EventType == "pull_request_review_comment" ||
-			event.EventType == "issue_comment" ||
-			event.EventType == "issues" ||
-			isCIEvent
-		if !isBotAllowed {
-			slog.Info("Bot user event skipped", "sender", sender, "event", event.EventType)
+		if !botUserInteractionEvent(event.EventType) {
+			slog.Info("Bot user event skipped", "sender", botSender, "event", event.EventType)
 			return nil
 		}
 	}
@@ -1738,8 +1732,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// Bot 用户的事件必须找到父消息才发送，否则跳过
-	if isBotUser && parentID == "" && !isCIEvent {
-		slog.Info("Bot user event skipped: no parent message found", "sender", sender, "event", event.EventType)
+	if isBotUser && parentID == "" {
+		slog.Info("Bot user event skipped: no parent message found", "sender", botSender, "event", event.EventType)
 		return nil
 	}
 

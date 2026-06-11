@@ -25,7 +25,7 @@
 | `FEISHU_WEBHOOK` | 飞书自定义机器人 Webhook 地址 | `https://open.feishu.cn/open-apis/bot/v2/hook/...` |
 | `FEISHU_SECRET` | 飞书机器人安全校验密钥 | `your_feishu_secret` |
 | `GITHUB_KEY` | GitHub Webhook Secret | `your_github_secret` |
-| `GITHUB_BOT_USERS` | (可选) 忽略推送的用户列表，逗号分隔 | `bot-user,silent-dev` |
+| `GITHUB_BOT_USERS` | (可选) 忽略推送的用户列表，逗号分隔；会过滤 CI/Workflow 等独立通知，PR/Issue/评论类事件仅在能关联到父消息时作为话题回复发送 | `github-advanced-security[bot],dependabot[bot]` |
 | `FEISHU_APP_ID` | (可选) 飞书应用 App ID | `cli_xxx` |
 | `FEISHU_APP_SECRET` | (可选) 飞书应用 App Secret | `xxx` |
 | `FEISHU_CHAT_ID` | (可选) 指定接收消息的群组 ID | `oc_xxx` |

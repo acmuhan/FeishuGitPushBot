@@ -517,8 +517,96 @@ func TestParsePullRequestNormalizesLiteralNewlinesAndPlainTitle(t *testing.T) {
 	if !strings.Contains(detail.Text, "Summary\n- 为帖子点赞和评论创建通知") {
 		t.Fatalf("Text did not normalize summary list: %q", detail.Text)
 	}
-	if !strings.Contains(detail.Text, "## Verification\n- npm run typecheck") {
+	if strings.Contains(detail.Text, "## Verification") {
+		t.Fatalf("Markdown heading should be downgraded for Feishu card body: %q", detail.Text)
+	}
+	if !strings.Contains(detail.Text, "Verification\n- npm run typecheck") {
 		t.Fatalf("Text did not preserve markdown section/list: %q", detail.Text)
+	}
+
+	card := BuildCard(context.Background(), "NCUHOME/youth-pen", "J621111", "https://github.com/J621111", "", detail)
+	var bodyContent string
+	for _, element := range card.Body.Elements {
+		el, ok := element.(map[string]any)
+		if !ok || el["tag"] != "markdown" {
+			continue
+		}
+		content, _ := el["content"].(string)
+		if strings.Contains(content, "feat: 通知功能基础实现") {
+			bodyContent = content
+			break
+		}
+	}
+	if bodyContent == "" {
+		t.Fatalf("PR body markdown block not found in card: %#v", card.Body.Elements)
+	}
+	if strings.Contains(bodyContent, `\n`) {
+		t.Fatalf("Card body still contains literal newline escapes: %q", bodyContent)
+	}
+	if strings.Contains(bodyContent, "## Verification") || strings.Contains(bodyContent, "**feat: 通知功能基础实现**") {
+		t.Fatalf("Card body contains oversized markdown markers: %q", bodyContent)
+	}
+	if !strings.Contains(bodyContent, "Summary\n- 为帖子点赞和评论创建通知") {
+		t.Fatalf("Card body did not preserve normalized newlines: %q", bodyContent)
+	}
+}
+
+func TestProcessGithubMarkdownDoesNotNormalizeLiteralNewlinesInsideCodeFence(t *testing.T) {
+	input := "Before\\n```js\\nconst s = \"hello\\\\nworld\";\\n```\\nAfter"
+	text, _ := ProcessGithubMarkdown(input)
+
+	if !strings.Contains(text, "Before\n```js") {
+		t.Fatalf("Text did not normalize literal newlines outside fence: %q", text)
+	}
+	if !strings.Contains(text, `hello\\nworld`) {
+		t.Fatalf("Code fence literal newline escape was modified: %q", text)
+	}
+	if strings.Contains(text, "##") {
+		t.Fatalf("Unexpected markdown heading marker in text: %q", text)
+	}
+}
+
+func TestProcessGithubMarkdownDoesNotNormalizeEscapedBackslashNewline(t *testing.T) {
+	text, _ := ProcessGithubMarkdown(`Path C:\\new-folder\nNext`)
+
+	if strings.Contains(text, "C:\\\n") {
+		t.Fatalf("Escaped backslash newline should not split path text: %q", text)
+	}
+	if !strings.Contains(text, `C:\\new-folder`) {
+		t.Fatalf("Escaped backslash path was modified: %q", text)
+	}
+}
+
+func TestProcessGithubMarkdownDowngradesHeadingsWithoutTrimmingContentHash(t *testing.T) {
+	text, _ := ProcessGithubMarkdown("## C#\\n## Verification ##")
+
+	if strings.Contains(text, "##") {
+		t.Fatalf("Heading markers should be removed: %q", text)
+	}
+	if !strings.Contains(text, "C#\nVerification") {
+		t.Fatalf("Heading content was not preserved correctly: %q", text)
+	}
+}
+
+func TestProcessGithubMarkdownDowngradesHTMLHeadings(t *testing.T) {
+	text, _ := ProcessGithubMarkdown("<h2>Verification</h2><ul><li>npm run lint</li></ul>")
+
+	if strings.Contains(text, "**Verification**") {
+		t.Fatalf("HTML heading should not be converted to bold heading text: %q", text)
+	}
+	if !strings.Contains(text, "Verification\n- npm run lint") {
+		t.Fatalf("HTML heading/list not preserved as compact text: %q", text)
+	}
+}
+
+func TestProcessGithubMarkdownDowngradesHTMLHeadingsWithAttributes(t *testing.T) {
+	text, _ := ProcessGithubMarkdown(`<h2 id="verification">Verification</h2><ul><li class="task">npm run lint</li></ul>`)
+
+	if strings.Contains(text, "**Verification**") || strings.Contains(text, "<h2") {
+		t.Fatalf("HTML heading should be downgraded to plain text: %q", text)
+	}
+	if !strings.Contains(text, "Verification\n- npm run lint") {
+		t.Fatalf("HTML heading/list with attributes not preserved as compact text: %q", text)
 	}
 }
 
