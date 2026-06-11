@@ -242,6 +242,26 @@ func workflowRunBaseID(m map[string]any) string {
 	return "wf:" + runID
 }
 
+func workflowRunPRNumber(m map[string]any) string {
+	prs, _ := m["pull_requests"].([]any)
+	if len(prs) == 0 {
+		return ""
+	}
+	if pr, ok := prs[0].(map[string]any); ok {
+		switch num := pr["number"].(type) {
+		case float64:
+			return strconv.Itoa(int(num))
+		case int:
+			return strconv.Itoa(num)
+		case int64:
+			return strconv.FormatInt(num, 10)
+		case string:
+			return num
+		}
+	}
+	return ""
+}
+
 func workflowRunAttemptID(m map[string]any) string {
 	baseID := workflowRunBaseID(m)
 	if baseID == "" {
@@ -1048,7 +1068,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	_ = json.Unmarshal(payload, &m)
 	repo := ext(m, "repository", "full_name")
 	repoUrl := ext(m, "repository", "html_url")
-	sender := ext(m, "sender", "login")
+	webhookSender := ext(m, "sender", "login")
+	sender := webhookSender
 	senderUrl := ext(m, "sender", "html_url")
 	avatarUrl := ext(m, "sender", "avatar_url")
 	detail.RepoName = repo   // 用于合并展示的仓库全名
@@ -1068,22 +1089,15 @@ func processWebhookEvent(event WebhookEvent) error {
 
 	// 检查是否为 Bot 用户
 	isBotUser := false
-	if C.Github.BotUsers != "" && sender != "" {
-		// 简单的缓存或直接字符串包含检查即可，不需要每次都 Split
-		if strings.Contains(","+C.Github.BotUsers+",", ","+sender+",") {
-			isBotUser = true
-		}
+	botSender := ""
+	if matchedSender, ok := configuredBotEventActor(m, sender, webhookSender); ok {
+		isBotUser = true
+		botSender = matchedSender
 	}
-	// Bot 用户只处理 PR 和 Comment 事件，其他一律跳过
+	// Bot 用户只处理 PR 和 Comment/Issue 互动事件，其他一律跳过
 	if isBotUser {
-		isBotAllowed := event.EventType == "pull_request" ||
-			event.EventType == "pull_request_review" ||
-			event.EventType == "pull_request_review_comment" ||
-			event.EventType == "issue_comment" ||
-			event.EventType == "issues" ||
-			isCIEvent
-		if !isBotAllowed {
-			slog.Info("Bot user event skipped", "sender", sender, "event", event.EventType)
+		if !botUserInteractionEvent(event.EventType) {
+			slog.Info("Bot user event skipped", "sender", botSender, "event", event.EventType)
 			return nil
 		}
 	}
@@ -1653,6 +1667,25 @@ func processWebhookEvent(event WebhookEvent) error {
 		}
 	}
 
+	// 4.7 Workflow 关联 PR：workflow_run 事件尝试通过 pull_requests 数组或 SHA 关联父 PR 消息
+	if event.EventType == "workflow_run" && parentID == "" {
+		if prNum := workflowRunPRNumber(m); prNum != "" {
+			var record MessageRecord
+			searchID := fmt.Sprintf("pr:%s:%s", repo, prNum)
+			if err := DB.NewSelect().Model(&record).
+				Where("github_id = ?", searchID).
+				Where("updated_at > ?", time.Now().Add(-getThreadReplyWindow())).
+				Order("id ASC").Limit(1).Scan(ctx); err == nil {
+				parentID = record.FeishuMessageID
+			}
+		}
+		if parentID == "" && sha != "" {
+			if rec := findParentRecordBySHA(ctx, repo, sha); rec != nil {
+				parentID = rec.FeishuMessageID
+			}
+		}
+	}
+
 	// 5. 查找父级 ID (回复逻辑)
 	// 改为：只要是 Issue/PR/Discussion 相关的非"创建"事件，都尝试寻找父消息进行话题回复
 	// 注意：CI/Workflow 事件不在这里处理，它们独立成卡，由 4.1 维护状态。
@@ -1738,8 +1771,8 @@ func processWebhookEvent(event WebhookEvent) error {
 	}
 
 	// Bot 用户的事件必须找到父消息才发送，否则跳过
-	if isBotUser && parentID == "" && !isCIEvent {
-		slog.Info("Bot user event skipped: no parent message found", "sender", sender, "event", event.EventType)
+	if isBotUser && parentID == "" {
+		slog.Info("Bot user event skipped: no parent message found", "sender", botSender, "event", event.EventType)
 		return nil
 	}
 

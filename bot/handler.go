@@ -127,6 +127,11 @@ func GithubHandler(c *gin.Context) {
 	sender := ext(m, "sender", "login")
 	senderUrl := ext(m, "sender", "html_url")
 	avatarUrl := ext(m, "sender", "avatar_url")
+	if botSender, ok := configuredBotEventActor(m, sender); ok {
+		slog.Info("Bot user event skipped", "sender", botSender, "event", eventType)
+		c.JSON(200, gin.H{"code": 0, "msg": "ignored"})
+		return
+	}
 	detail.RepoURL = repoUrl
 	card := BuildCard(c.Request.Context(), repo, sender, senderUrl, avatarUrl, detail)
 	if _, err := SendToChat("", card); err != nil {

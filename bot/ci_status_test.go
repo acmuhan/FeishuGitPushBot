@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,58 @@ func TestRenderCIStatusCleansCompactWorkflowTitlePrefix(t *testing.T) {
 	assert.Contains(t, got, "✅ Scheduled **passed**")
 	assert.NotContains(t, got, "✅ ✅")
 	assert.NotContains(t, got, "Workflow Succeeded")
+}
+
+func TestRenderCIStatusCleansNestedWorkflowTitlePrefixes(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "✅ Workflow Succeeded: ✅Workflow Succeeded: Scheduled",
+			Status:       "completed",
+			Conclusion:   "success",
+			RunID:        12345,
+		},
+	}, "")
+
+	assert.Equal(t, "✅ Scheduled **passed**", got)
+}
+
+func TestRenderCIStatusCleansUnknownWorkflowTitlePrefix(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "⚠️ Workflow Startup Failure: Scheduled",
+			Status:       "completed",
+			Conclusion:   "startup_failure",
+			RunID:        12345,
+		},
+	}, "")
+
+	assert.Equal(t, "⚠️ Scheduled **startup failure**", got)
+}
+
+func TestMakeCIActionButtonsCleansWorkflowTitlePrefix(t *testing.T) {
+	got := makeCIActionButtons([]CIStatus{
+		{
+			WorkflowName: "❌ Workflow Failed: ✅Workflow Succeeded: Scheduled",
+			Status:       "completed",
+			Conclusion:   "failure",
+			RunID:        12345,
+		},
+	}, "https://github.com/NCUHOME/putable")
+
+	assert.Len(t, got, 2)
+	assert.Equal(t, "View Scheduled Logs", got[0].Text)
+}
+
+func TestRenderCIStatusKeepsWorkflowNameThatStartsWithWorkflow(t *testing.T) {
+	got := renderCIStatuses([]CIStatus{
+		{
+			WorkflowName: "Workflow Builder: Test",
+			Status:       "completed",
+			Conclusion:   "success",
+		},
+	}, "")
+
+	assert.Equal(t, "✅ Workflow Builder: Test **passed**", got)
 }
 
 func TestRenderCIStatusLifecycleStates(t *testing.T) {
@@ -148,4 +201,79 @@ func TestBranchPushUsesDividerBetweenMergedPushes(t *testing.T) {
 	assert.Contains(t, cardJSON, `"tag":"hr"`)
 	assert.NotContains(t, cardJSON, "\\n---\\n")
 	assert.NotContains(t, cardJSON, "**docs:**")
+}
+
+func TestNormalizeLiteralNewlinesOutsideFences(t *testing.T) {
+	input := "Line1\\nLine2\n```go\ncode\\nhere\n```\nLine3"
+	got := normalizeLiteralNewlinesOutsideFences(input)
+
+	if !strings.Contains(got, "Line1\nLine2\n") {
+		t.Fatalf("literal \\n outside fence should be normalized: %q", got)
+	}
+	if !strings.Contains(got, "code\\nhere") {
+		t.Fatalf("literal \\n inside fence should be preserved: %q", got)
+	}
+}
+
+func TestNormalizeLiteralNewlinesPreservesFenceContent(t *testing.T) {
+	input := "Before\n```\nline1\\nline2\n```\nAfter"
+	got := normalizeLiteralNewlinesOutsideFences(input)
+
+	if !strings.Contains(got, "Before\n") {
+		t.Fatalf("text before fence should have real newline: %q", got)
+	}
+	if !strings.Contains(got, "line1\\nline2") {
+		t.Fatalf("literal \\n inside fence should be preserved: %q", got)
+	}
+	if !strings.Contains(got, "\nAfter") {
+		t.Fatalf("text after fence should have real newline: %q", got)
+	}
+}
+
+func TestNormalizeMarkdownHeadingsDowngradesHeadings(t *testing.T) {
+	input := "## Title\nSome text\n### Subtitle"
+	got := normalizeMarkdownHeadings(input)
+
+	if strings.Contains(got, "##") {
+		t.Fatalf("heading markers should be removed: %q", got)
+	}
+	if !strings.Contains(got, "Title\nSome text\nSubtitle") {
+		t.Fatalf("heading content should be preserved: %q", got)
+	}
+}
+
+func TestNormalizeMarkdownHeadingsSkipsContentInsideFences(t *testing.T) {
+	input := "Before\n```\n## Not a heading\n```\n## Real heading"
+	got := normalizeMarkdownHeadings(input)
+
+	if strings.Contains(got, "Not a heading") {
+		fenceContent := "## Not a heading"
+		if !strings.Contains(got, fenceContent) {
+			t.Fatalf("fence content should be preserved as-is: %q", got)
+		}
+	}
+	if strings.Contains(got, "## Real heading") {
+		t.Fatalf("heading outside fence should be downgraded: %q", got)
+	}
+}
+
+func TestIsFenceLine(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"```", true},
+		{"```go", true},
+		{"~~~", true},
+		{"~~~python", true},
+		{"  ```  ", true},
+		{"not a fence", false},
+		{"`` not enough", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isFenceLine(tt.input); got != tt.want {
+			t.Errorf("isFenceLine(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
 }

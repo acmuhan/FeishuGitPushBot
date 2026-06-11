@@ -1618,22 +1618,27 @@ func upsertRenderedCIStatus(statuses []CIStatus, status CIStatus) []CIStatus {
 }
 
 func cleanCIStatusDisplayName(name string) string {
-	name = strings.TrimSpace(name)
 	for {
 		trimmed := strings.TrimSpace(name)
-		next := trimmed
-		for _, icon := range []string{"✅", "❌", "⏳", "⚙️", "🚫", "🕒", "⏭️", "➖", "⚠️"} {
-			if strings.HasPrefix(next, icon) {
-				next = strings.TrimSpace(strings.TrimPrefix(next, icon))
-				break
-			}
-		}
+		next := trimCIStatusIcon(trimmed)
+		next = trimWorkflowTitlePrefix(next)
 		if next == trimmed {
-			name = trimmed
-			break
+			return trimmed
 		}
 		name = next
 	}
+}
+
+func trimCIStatusIcon(name string) string {
+	for _, icon := range []string{"✅", "❌", "⏳", "⚙️", "🚫", "🕒", "⏭️", "➖", "⚠️"} {
+		if strings.HasPrefix(name, icon) {
+			return strings.TrimSpace(strings.TrimPrefix(name, icon))
+		}
+	}
+	return name
+}
+
+func trimWorkflowTitlePrefix(name string) string {
 	for _, prefix := range []string{
 		"Workflow Succeeded: ",
 		"Workflow Failed: ",
@@ -1644,16 +1649,23 @@ func cleanCIStatusDisplayName(name string) string {
 		"Workflow Waiting: ",
 		"Workflow Completed: ",
 		"Workflow Cancelled: ",
+		"Workflow Canceled: ",
 		"Workflow Timed_out: ",
 		"Workflow Timed Out: ",
 		"Workflow Neutral: ",
 		"Workflow Skipped: ",
 		"Workflow Action_required: ",
 		"Workflow Action Required: ",
+		"Workflow Startup Failure: ",
+		"Workflow Startup_failure: ",
+		"Workflow Stale: ",
 	} {
 		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
 			return strings.TrimSpace(name[len(prefix):])
 		}
+	}
+	if match := workflowTitlePrefixRe.FindString(name); match != "" {
+		return strings.TrimSpace(name[len(match):])
 	}
 	return name
 }
@@ -1756,8 +1768,13 @@ func makeCIActionButtons(statuses []CIStatus, repoURL string) []ActionButton {
 	for _, cs := range statuses {
 		if ciConclusionNeedsAttention(cs.Conclusion) && cs.RunID > 0 && !seenRuns[cs.RunID] {
 			seenRuns[cs.RunID] = true
+			displayName := cs.WorkflowName
+			if strings.HasPrefix(displayName, "job:") && cs.JobName != "" {
+				displayName = cs.JobName
+			}
+			displayName = cleanCIStatusDisplayName(displayName)
 			btns = append(btns, ActionButton{
-				Text: fmt.Sprintf("View %s Logs", cs.WorkflowName),
+				Text: fmt.Sprintf("View %s Logs", displayName),
 				URL:  fmt.Sprintf("%s/actions/runs/%d", repoURL, cs.RunID),
 				Type: "danger",
 			})
@@ -2224,6 +2241,9 @@ func containsMarkdownList(s string) bool {
 	return markdownListRe.MatchString(s)
 }
 
+var markdownHeadingRe = regexp.MustCompile(`^[ \t]{0,3}#{1,6}[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$`)
+var workflowTitlePrefixRe = regexp.MustCompile(`(?i)^Workflow (Succeeded|Failed|Running|Started|Requested|Queued|Waiting|Completed|Cancelled|Canceled|Timed[_ ]?Out|Neutral|Skipped|Action[_ ]?Required|Startup[_ ]?Failure|Stale):\s*`)
+
 // ProcessCommitMessage 处理提交信息，转换 emoji、规范 Conventional Commit 前缀空格，并转换 SHA/Issue 为链接
 func ProcessCommitMessage(msg string, repoUrl string) string {
 	msg = strings.TrimSpace(msg)
@@ -2333,10 +2353,10 @@ var (
 	reTable        = regexp.MustCompile(`(?is)<table.*?>(.*?)</table>`)
 	reTr           = regexp.MustCompile(`(?is)<tr.*?>(.*?)</tr>`)
 	reTd           = regexp.MustCompile(`(?is)<t[dh].*?>(.*?)</t[dh]>`)
-	reP            = regexp.MustCompile(`(?is)<p\s*>(.*?)</p>`)
-	reHeading      = regexp.MustCompile(`(?is)<h([1-6])\s*>(.*?)</h[1-6]>`)
-	reLi           = regexp.MustCompile(`(?is)<li\s*>(.*?)</li>`)
-	reBq           = regexp.MustCompile(`(?is)<blockquote\s*>(.*?)</blockquote>`)
+	reP            = regexp.MustCompile(`(?is)<p\b[^>]*>(.*?)</p>`)
+	reHeading      = regexp.MustCompile(`(?is)<h[1-6]\b[^>]*>(.*?)</h[1-6]>`)
+	reLi           = regexp.MustCompile(`(?is)<li\b[^>]*>(.*?)</li>`)
+	reBq           = regexp.MustCompile(`(?is)<blockquote\b[^>]*>(.*?)</blockquote>`)
 	reHr           = regexp.MustCompile(`(?is)<hr\s*/?>`)
 	reStripHTML    = regexp.MustCompile(`(?s)<[^>]*>`)
 	reMultiNewline = regexp.MustCompile(`\n{3,}`)
@@ -2411,8 +2431,8 @@ func convertBlockTags(s string) string {
 	s = reP.ReplaceAllString(s, "$1\n\n")
 	s = reHeading.ReplaceAllStringFunc(s, func(m string) string {
 		match := reHeading.FindStringSubmatch(m)
-		if len(match) > 2 {
-			return "\n**" + strings.TrimSpace(match[2]) + "**\n"
+		if len(match) > 1 {
+			return "\n" + strings.TrimSpace(match[1]) + "\n"
 		}
 		return m
 	})
@@ -2428,9 +2448,9 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 		return "", ""
 	}
 
-	// 1. 预处理 Mermaid
-	s = strings.ReplaceAll(s, `\r\n`, "\n")
-	s = strings.ReplaceAll(s, `\n`, "\n")
+	// 1. 预处理 Markdown：外部文本中的字面 \n 还原为换行，标题降级为普通文本。
+	s = normalizeLiteralNewlinesOutsideFences(s)
+	s = normalizeMarkdownHeadings(s)
 	s = strings.ReplaceAll(s, "```mermaid", "```")
 
 	// 2. 提取 <details> <summary> 折叠内容
@@ -2460,6 +2480,113 @@ func ProcessGithubMarkdown(s string) (text string, foldable string) {
 	foldable = SafeText(strings.Join(foldables, "\n\n"), 50000)
 
 	return text, foldable
+}
+
+type markdownLine struct {
+	text string
+	sep  string
+}
+
+func splitMarkdownLogicalLines(s string) []markdownLine {
+	var lines []markdownLine
+	for len(s) > 0 {
+		idx, sep, sepLen := nextMarkdownLineBreak(s)
+		if idx < 0 {
+			lines = append(lines, markdownLine{text: s})
+			break
+		}
+		lines = append(lines, markdownLine{text: s[:idx], sep: sep})
+		s = s[idx+sepLen:]
+	}
+	return lines
+}
+
+func nextMarkdownLineBreak(s string) (idx int, sep string, sepLen int) {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\r':
+			if i+1 < len(s) && s[i+1] == '\n' {
+				return i, "\r\n", 2
+			}
+			return i, "\r", 1
+		case '\n':
+			return i, "\n", 1
+		case '\\':
+			if isEscapedBackslash(s, i) {
+				continue
+			}
+			if i+3 < len(s) && s[i+1] == 'r' && s[i+2] == '\\' && s[i+3] == 'n' {
+				return i, `\r\n`, 4
+			}
+			if i+1 < len(s) && s[i+1] == 'n' {
+				return i, `\n`, 2
+			}
+		}
+	}
+	return -1, "", 0
+}
+
+func isEscapedBackslash(s string, idx int) bool {
+	count := 0
+	for i := idx - 1; i >= 0 && s[i] == '\\'; i-- {
+		count++
+	}
+	return count%2 == 1
+}
+
+func isFenceLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
+}
+
+func normalizeLiteralNewlinesOutsideFences(s string) string {
+	lines := splitMarkdownLogicalLines(s)
+	var out strings.Builder
+	inFence := false
+	for _, line := range lines {
+		wasInFence := inFence
+		fence := isFenceLine(line.text)
+		if fence && wasInFence {
+			inFence = false
+		}
+		out.WriteString(line.text)
+		if line.sep != "" {
+			if inFence {
+				out.WriteString(line.sep)
+			} else {
+				out.WriteString("\n")
+			}
+		}
+		if fence && !wasInFence {
+			inFence = true
+		}
+	}
+	return out.String()
+}
+
+func normalizeMarkdownHeadings(s string) string {
+	lines := splitMarkdownLogicalLines(s)
+	var out strings.Builder
+	inFence := false
+	for _, line := range lines {
+		wasInFence := inFence
+		fence := isFenceLine(line.text)
+		if fence && wasInFence {
+			inFence = false
+		}
+		text := line.text
+		if !inFence {
+			if match := markdownHeadingRe.FindStringSubmatch(text); len(match) == 2 {
+				text = strings.TrimSpace(match[1])
+			}
+		}
+		out.WriteString(text)
+		out.WriteString(line.sep)
+		if fence && !wasInFence {
+			inFence = true
+		}
+	}
+	return out.String()
 }
 
 // GetDiffOnlyAdded 生成仅包含新增内容的 Diff
