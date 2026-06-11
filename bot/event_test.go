@@ -834,3 +834,56 @@ func TestSendNewEventTypeCards(t *testing.T) {
 	}
 	fmt.Println("✓ Code Scanning Alert card sent, message_id:", msgID3)
 }
+
+func TestWorkflowRunPRNumberExtractsNumber(t *testing.T) {
+	m := map[string]any{
+		"pull_requests": []any{
+			map[string]any{"number": float64(26)},
+		},
+	}
+	if got := workflowRunPRNumber(m); got != "26" {
+		t.Fatalf("workflowRunPRNumber() = %q, want 26", got)
+	}
+}
+
+func TestWorkflowRunPRNumberHandlesIntType(t *testing.T) {
+	m := map[string]any{
+		"pull_requests": []any{
+			map[string]any{"number": int(42)},
+		},
+	}
+	if got := workflowRunPRNumber(m); got != "42" {
+		t.Fatalf("workflowRunPRNumber() = %q, want 42", got)
+	}
+}
+
+func TestWorkflowRunPRNumberHandlesStringType(t *testing.T) {
+	m := map[string]any{
+		"pull_requests": []any{
+			map[string]any{"number": "7"},
+		},
+	}
+	if got := workflowRunPRNumber(m); got != "7" {
+		t.Fatalf("workflowRunPRNumber() = %q, want 7", got)
+	}
+}
+
+func TestWorkflowRunPRNumberReturnsEmptyForNilPayload(t *testing.T) {
+	if got := workflowRunPRNumber(nil); got != "" {
+		t.Fatalf("workflowRunPRNumber(nil) = %q, want empty", got)
+	}
+}
+
+func TestWorkflowRunPRNumberReturnsEmptyForEmptyArray(t *testing.T) {
+	m := map[string]any{"pull_requests": []any{}}
+	if got := workflowRunPRNumber(m); got != "" {
+		t.Fatalf("workflowRunPRNumber() = %q, want empty", got)
+	}
+}
+
+func TestWorkflowRunPRNumberReturnsEmptyForMissingField(t *testing.T) {
+	m := map[string]any{}
+	if got := workflowRunPRNumber(m); got != "" {
+		t.Fatalf("workflowRunPRNumber() = %q, want empty", got)
+	}
+}

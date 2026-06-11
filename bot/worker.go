@@ -248,10 +248,14 @@ func workflowRunPRNumber(m map[string]any) string {
 		return ""
 	}
 	if pr, ok := prs[0].(map[string]any); ok {
-		if num, ok := pr["number"].(float64); ok {
+		switch num := pr["number"].(type) {
+		case float64:
 			return strconv.Itoa(int(num))
-		}
-		if num, ok := pr["number"].(string); ok {
+		case int:
+			return strconv.Itoa(num)
+		case int64:
+			return strconv.FormatInt(num, 10)
+		case string:
 			return num
 		}
 	}

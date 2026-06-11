@@ -1649,12 +1649,16 @@ func trimWorkflowTitlePrefix(name string) string {
 		"Workflow Waiting: ",
 		"Workflow Completed: ",
 		"Workflow Cancelled: ",
+		"Workflow Canceled: ",
 		"Workflow Timed_out: ",
 		"Workflow Timed Out: ",
 		"Workflow Neutral: ",
 		"Workflow Skipped: ",
 		"Workflow Action_required: ",
 		"Workflow Action Required: ",
+		"Workflow Startup Failure: ",
+		"Workflow Startup_failure: ",
+		"Workflow Stale: ",
 	} {
 		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
 			return strings.TrimSpace(name[len(prefix):])
