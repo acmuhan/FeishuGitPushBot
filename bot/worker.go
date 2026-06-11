@@ -2,7 +2,9 @@ package bot
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -100,6 +102,16 @@ func webhookMergeLockKey(eventType string, detail EventDetail, repo string) stri
 	return ""
 }
 
+// acquireEventLock 原子地抢占一个事件合并锁，避免两个实例并发处理同仓库的
+// 删除事件。锁有 TTL，进程崩溃后会自动过期。
+//
+// 实现采用单条 INSERT ... ON CONFLICT DO UPDATE ... WHERE ... RETURNING，
+// 在一次往返中完成"清掉过期锁 + 抢占"两件事：
+//   - 键不存在 → 走 INSERT 分支，返回新行
+//   - 键存在且 expires_at < NOW() → 走 DO UPDATE 分支，覆盖过期锁
+//   - 键存在且未过期 → WHERE 过滤掉 DO UPDATE，RETURNING 为空 → 继续等待
+//
+// 这消除了之前"先 DELETE 过期 + 再 INSERT 竞争"两步操作之间的 TOCTOU 窗口。
 func acquireEventLock(ctx context.Context, key string, ttl time.Duration) (func(), error) {
 	if key == "" || DB == nil {
 		return func() {}, nil
@@ -111,24 +123,25 @@ func acquireEventLock(ctx context.Context, key string, ttl time.Duration) (func(
 			return nil, err
 		}
 
-		_, _ = DB.NewDelete().Model((*EventLock)(nil)).
-			Where("lock_key = ?", key).
-			Where("expires_at < NOW()").
-			Exec(ctx)
+		var got EventLock
+		err := DB.NewRaw(`
+			INSERT INTO event_locks (lock_key, expires_at)
+			VALUES (?, ?)
+			ON CONFLICT (lock_key) DO UPDATE
+			SET expires_at = EXCLUDED.expires_at
+			WHERE event_locks.expires_at < NOW()
+			RETURNING lock_key
+		`, key, time.Now().Add(ttl)).Scan(ctx, &got)
 
-		res, err := DB.NewInsert().
-			Model(&EventLock{LockKey: key, ExpiresAt: time.Now().Add(ttl)}).
-			On("CONFLICT (lock_key) DO NOTHING").
-			Exec(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if rows, _ := res.RowsAffected(); rows > 0 {
+		if err == nil && got.LockKey == key {
 			return func() {
 				_, _ = DB.NewDelete().Model((*EventLock)(nil)).
 					Where("lock_key = ?", key).
 					Exec(context.Background())
 			}, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
 		}
 
 		if time.Now().After(deadline) {
