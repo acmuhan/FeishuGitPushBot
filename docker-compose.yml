@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  feishu-git-push-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: feishu-git-push-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # 必需配置
+      FEISHU_WEBHOOK: ${FEISHU_WEBHOOK}
+      FEISHU_SECRET: ${FEISHU_SECRET}
+      GITHUB_KEY: ${GITHUB_KEY}
+      
+      # 可选配置 - 飞书应用
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_CHAT_ID: ${FEISHU_CHAT_ID:-}
+      
+      # 可选配置 - GitHub
+      GITHUB_BOT_USERS: ${GITHUB_BOT_USERS:-}
+      GITHUB_WEBHOOK_IPS: ${GITHUB_WEBHOOK_IPS:-}
+      
+      # 可选配置 - 数据库
+      DATABASE_URL: ${DATABASE_URL:-}
+      
+      # 可选配置 - 事件处理
+      EVENTS_MERGE_WINDOW: ${EVENTS_MERGE_WINDOW:-10}
+      EVENTS_THREAD_REPLY_WINDOW: ${EVENTS_THREAD_REPLY_WINDOW:-60}
+      
+      # 时区配置
+      TZ: Asia/Shanghai
+    
+    # 如果使用数据库，可选配置依赖关系
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+    
+    env_file:
+      - .env
+    
+    networks:
+      - feishu-network
+    
+    # 可选：健康检查
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # 可选：PostgreSQL 数据库（如需要）
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: feishu-bot-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER:-feishu_bot}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-feishu_bot_password}
+  #     POSTGRES_DB: ${POSTGRES_DB:-feishu_bot_db}
+  #     TZ: Asia/Shanghai
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - feishu-network
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-feishu_bot}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+networks:
+  feishu-network:
+    driver: bridge
+
+volumes:
+  # postgres_data:
+  #   driver: local
